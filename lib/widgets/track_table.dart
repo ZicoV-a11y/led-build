@@ -1,0 +1,2278 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HardwareKeyboard;
+
+import '../models/track.dart';
+import '../state/library_controller.dart';
+import '../theme/app_theme.dart';
+import '../utils/file_format.dart';
+import 'delete_track_dialog.dart';
+import 'link_track_dialog.dart';
+import 'move_copy_dialog.dart';
+import 'track_artwork.dart';
+import 'track_history_popup.dart';
+import 'variant_metadata_dialog.dart';
+
+class TrackTable extends StatefulWidget {
+  final LibraryController controller;
+  const TrackTable({super.key, required this.controller});
+
+  @override
+  State<TrackTable> createState() => _TrackTableState();
+}
+
+class _TrackTableState extends State<TrackTable> {
+  final ScrollController _scroll = ScrollController();
+  final ScrollController _hScroll = ScrollController();
+  String? _lastScrolledSelection;
+  // Viewport-driven enrichment debounce. We snapshot the visible
+  // row range only after scrolling settles for ~250ms, so a fast
+  // flick across thousands of rows enqueues only what stays on
+  // screen at the end. The 20-row look-ahead each side covers
+  // casual scrolling without ever amplifying into mass downloads.
+  Timer? _viewportDebounce;
+  static const _viewportLookahead = 20;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.revealTick.addListener(_onRevealRequested);
+    // Initial viewport snapshot once the table has laid out.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scheduleViewportReport();
+    });
+  }
+
+  @override
+  void dispose() {
+    _viewportDebounce?.cancel();
+    widget.controller.revealTick.removeListener(_onRevealRequested);
+    _scroll.dispose();
+    _hScroll.dispose();
+    super.dispose();
+  }
+
+  /// Reset the debounce timer. Each scroll notification calls this;
+  /// the actual snapshot only fires once movement settles.
+  void _scheduleViewportReport() {
+    _viewportDebounce?.cancel();
+    _viewportDebounce =
+        Timer(const Duration(milliseconds: 250), _emitViewport);
+  }
+
+  /// Snapshot the currently-visible track range (plus look-ahead)
+  /// and report the paths to the controller. The controller filters
+  /// out paths already enriched or already in flight.
+  void _emitViewport() {
+    if (!mounted || !_scroll.hasClients) return;
+    final c = widget.controller;
+    final tracks = c.visibleTracks;
+    if (tracks.isEmpty) return;
+    final extent = c.showArtwork ? 56.0 : 44.0;
+    final pos = _scroll.position;
+    final firstIdx =
+        ((pos.pixels / extent).floor() - _viewportLookahead);
+    final lastIdx = (((pos.pixels + pos.viewportDimension) / extent)
+            .ceil() +
+        _viewportLookahead);
+    final lo = firstIdx.clamp(0, tracks.length - 1);
+    final hi = lastIdx.clamp(0, tracks.length - 1);
+    if (hi < lo) return;
+    final paths = <String>[
+      for (var i = lo; i <= hi; i++) tracks[i].path,
+    ];
+    c.reportViewportPaths(paths);
+  }
+
+  void _onRevealRequested() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _centerOnCurrent();
+    });
+  }
+
+  void _centerOnCurrent() {
+    if (!_scroll.hasClients) return;
+    final c = widget.controller;
+    final uid = c.currentTrackUid;
+    if (uid == null) return;
+    final tracks = c.visibleTracks;
+    final idx = tracks.indexWhere((t) => t.uid == uid);
+    if (idx < 0) return;
+    final extent = c.showArtwork ? 56.0 : 44.0;
+    final view = _scroll.position.viewportDimension;
+    final maxScroll = _scroll.position.maxScrollExtent;
+    final target = (idx * extent - view / 2 + extent / 2).clamp(
+      0.0,
+      maxScroll,
+    );
+    _scroll.animateTo(
+      target,
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOut,
+    );
+  }
+
+  void _ensureSelectedVisible() {
+    if (!_scroll.hasClients) return;
+    final c = widget.controller;
+    final uid = c.selectedTrackUid;
+    if (uid == null || uid == _lastScrolledSelection) return;
+    final tracks = c.visibleTracks;
+    final idx = tracks.indexWhere((t) => t.uid == uid);
+    if (idx < 0) return;
+    final extent = c.showArtwork ? 56.0 : 44.0;
+    final target = idx * extent;
+    final view = _scroll.position.viewportDimension;
+    final current = _scroll.offset;
+    final maxScroll = _scroll.position.maxScrollExtent;
+    if (target < current) {
+      _scroll.jumpTo(target.clamp(0.0, maxScroll));
+    } else if (target + extent > current + view) {
+      _scroll.jumpTo((target + extent - view).clamp(0.0, maxScroll));
+    }
+    _lastScrolledSelection = uid;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.controller,
+      builder: (context, _) {
+        final c = widget.controller;
+        final tracks = c.visibleTracks;
+        final showArtwork = c.showArtwork;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _ensureSelectedVisible();
+          // Re-snapshot the viewport whenever the visible-tracks
+          // identity may have changed (sort / search / source
+          // switch). Cheap — just resets the debounce.
+          _scheduleViewportReport();
+        });
+        return LayoutBuilder(
+          builder: (ctx, constraints) {
+            // Suppress the framework's default platform scrollbar for
+            // all descendant Scrollables. Both axes use a single styled
+            // RawScrollbar instead — no double scrollbar at any time.
+            final noDefaultScrollbars =
+                ScrollConfiguration.of(ctx).copyWith(scrollbars: false);
+
+            // Natural row width = sum of every column's stored width
+            // + 7 dividers (6 inter-column + 1 trailing right edge,
+            // 6 px each). No outer padding — the table sits flush
+            // against the sidebar divider on the left and uses its
+            // trailing _ColumnDivider as the closing right edge.
+            // Resizing TITLE / ARTIST grows or shrinks the row's
+            // total; horizontal scroll engages when it exceeds the
+            // viewport.
+            const gapTotal = 7 * 6.0;
+            final naturalWidth = c.colFavWidth +
+                c.colRevWidth +
+                c.colTitleWidth +
+                c.colArtistWidth +
+                c.colBpmWidth +
+                c.colTimeWidth +
+                c.colPlaysWidth +
+                gapTotal;
+            final contentWidth = naturalWidth > constraints.maxWidth
+                ? naturalWidth
+                : constraints.maxWidth;
+            // Both scrollbars share the same styling so vertical and
+            // horizontal scroll feel like one consistent system.
+            // crossAxisMargin pushes the bar inward from the window
+            // edge so it doesn't collide with the macOS resize zone
+            // and is easier to grab.
+            const scrollbarThickness = 8.0;
+            const scrollbarRadius = Radius.circular(4);
+            const scrollbarMargin = 4.0;
+            final scrollbarColor = const Color(0xFF6E6E78).withValues(
+              alpha: 0.7,
+            );
+
+            final body = SizedBox(
+              width: contentWidth,
+              child: Column(
+                children: [
+                  _TableHeader(controller: c),
+                  const Divider(height: 1, color: AppColors.border),
+                  Expanded(
+                    child: tracks.isEmpty
+                        ? _EmptyState(hasFolders: c.sources.isNotEmpty)
+                        : RawScrollbar(
+                            controller: _scroll,
+                            thumbVisibility: true,
+                            thickness: scrollbarThickness,
+                            radius: scrollbarRadius,
+                            thumbColor: scrollbarColor,
+                            crossAxisMargin: scrollbarMargin,
+                            mainAxisMargin: scrollbarMargin,
+                            child: ScrollConfiguration(
+                              behavior: noDefaultScrollbars,
+                              // NotificationListener intercepts scroll
+                              // updates; we only RESET the debounce
+                              // here. The actual viewport snapshot
+                              // fires when scrolling settles, so a
+                              // fast flick across thousands of rows
+                              // enqueues only the rows the user
+                              // ends up looking at.
+                              child: NotificationListener<ScrollNotification>(
+                                onNotification: (n) {
+                                  _scheduleViewportReport();
+                                  return false;
+                                },
+                                child: ListView.builder(
+                                  controller: _scroll,
+                                  itemExtent: showArtwork ? 56 : 44,
+                                  itemCount: tracks.length,
+                                  itemBuilder: (context, index) {
+                                    final t = tracks[index];
+                                    return _TrackRow(
+                                      key: ValueKey(t.uid),
+                                      track: t,
+                                      controller: c,
+                                      showArtwork: showArtwork,
+                                    );
+                                  },
+                                ),
+                              ),
+                            ),
+                          ),
+                  ),
+                ],
+              ),
+            );
+
+            return RawScrollbar(
+              controller: _hScroll,
+              thumbVisibility: true,
+              thickness: scrollbarThickness,
+              radius: scrollbarRadius,
+              thumbColor: scrollbarColor,
+              crossAxisMargin: scrollbarMargin,
+              mainAxisMargin: scrollbarMargin,
+              child: ScrollConfiguration(
+                behavior: noDefaultScrollbars,
+                child: SingleChildScrollView(
+                  controller: _hScroll,
+                  scrollDirection: Axis.horizontal,
+                  physics: const ClampingScrollPhysics(),
+                  child: body,
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  final bool hasFolders;
+  const _EmptyState({required this.hasFolders});
+
+  @override
+  Widget build(BuildContext context) {
+    final message = hasFolders
+        ? 'No tracks match your filters.'
+        : 'No watched folders yet.\nClick "Add folder" to scan your music.';
+    return Center(
+      child: Text(
+        message,
+        textAlign: TextAlign.center,
+        style: const TextStyle(
+          color: AppColors.textSecondary,
+          fontSize: 13,
+          height: 1.4,
+        ),
+      ),
+    );
+  }
+}
+
+class _TableHeader extends StatelessWidget {
+  final LibraryController controller;
+  const _TableHeader({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 30,
+      color: AppColors.surface,
+      padding: EdgeInsets.zero,
+      child: Builder(
+        builder: (context) {
+          final order = controller.columnOrder;
+          const animDuration = Duration(milliseconds: 220);
+          const animCurve = Curves.easeOutCubic;
+          const dividerWidth = 6.0;
+          const headerHeight = 30.0;
+
+          final children = <Widget>[];
+          var x = 0.0;
+
+          for (var i = 0; i < order.length; i++) {
+            final col = order[i];
+            final w = _columnWidth(col, controller);
+
+            children.add(AnimatedPositioned(
+              key: ValueKey('hdr_$col'),
+              duration: animDuration,
+              curve: animCurve,
+              left: x,
+              top: 0,
+              height: headerHeight,
+              width: w,
+              child: _DraggableHeaderCell(
+                column: col,
+                width: w,
+                controller: controller,
+                child: _buildHeaderInner(col, controller),
+              ),
+            ));
+            x += w;
+
+            if (i < order.length - 1) {
+              children.add(AnimatedPositioned(
+                key: ValueKey('hdr_gap_after_$col'),
+                duration: animDuration,
+                curve: animCurve,
+                left: x,
+                top: 0,
+                height: headerHeight,
+                width: dividerWidth,
+                child: _buildHeaderGap(col, controller),
+              ));
+              x += dividerWidth;
+            }
+          }
+
+          // Trailing divider — closing edge of the rightmost column.
+          children.add(AnimatedPositioned(
+            key: const ValueKey('hdr_trailing'),
+            duration: animDuration,
+            curve: animCurve,
+            left: x,
+            top: 0,
+            height: headerHeight,
+            width: dividerWidth,
+            child: const _ColumnDivider(),
+          ));
+
+          return Stack(clipBehavior: Clip.none, children: children);
+        },
+      ),
+    );
+  }
+}
+
+/// Single subtle 1 px line at the center of a 6 px gap — the *only*
+/// visible thing between columns. The line uses a brightness slightly
+/// above `AppColors.border` so it actually reads against the dark surface
+/// (border alone is too close to the background to be visible). `alpha`
+/// scales the brightness for rows where the divider should be quieter.
+class _ColumnDivider extends StatelessWidget {
+  final double alpha;
+  const _ColumnDivider({this.alpha = 1.0});
+
+  // Slightly above the dark surface — visible at full alpha, still subtle.
+  static const _baseColor = Color(0xFF3F3F46);
+
+  @override
+  Widget build(BuildContext context) {
+    final color = alpha == 1.0
+        ? _baseColor
+        : _baseColor.withValues(alpha: alpha);
+    return SizedBox(
+      width: 6,
+      // height: double.infinity so the SizedBox stretches to fill the
+      // Row's cross-axis (header is 30 tall, rows match itemExtent). The
+      // inner Container then renders a full-height 1 px line.
+      height: double.infinity,
+      child: Center(
+        child: Container(width: 1, color: color),
+      ),
+    );
+  }
+}
+
+/// Right-edge resize handle. *Same width as `_ColumnDivider`* (6 px) so
+/// it occupies the same horizontal layout space as the row dividers
+/// underneath — keeping every column boundary in the header at the same
+/// x as the corresponding row boundary. Forgiveness for fast drags
+/// comes from Flutter's built-in pointer tracking: once a horizontal
+/// drag is recognised, the gesture follows the cursor anywhere until
+/// pointer-up (no need to widen the hit zone past the visible line).
+///
+/// On every drag-update frame `onDelta(dx, commit: false)` fires —
+/// keeping per-frame work to a single notify, no SQLite write. On drag
+/// end (or cancel) `onDelta(0, commit: true)` flushes the final value
+/// once.
+class _ResizeHandle extends StatelessWidget {
+  final void Function(double dx, {bool commit}) onDelta;
+  const _ResizeHandle({required this.onDelta});
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: (d) =>
+            onDelta(d.delta.dx, commit: false),
+        onHorizontalDragEnd: (_) => onDelta(0, commit: true),
+        onHorizontalDragCancel: () => onDelta(0, commit: true),
+        child: const _ColumnDivider(),
+      ),
+    );
+  }
+}
+
+class _HeaderCell extends StatelessWidget {
+  final String label;
+  final TrackSortColumn column;
+  final LibraryController controller;
+  final TextAlign align;
+
+  const _HeaderCell({
+    required this.label,
+    required this.column,
+    required this.controller,
+    required this.align,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final mainAlign = align == TextAlign.right
+        ? MainAxisAlignment.end
+        : align == TextAlign.center
+            ? MainAxisAlignment.center
+            : MainAxisAlignment.start;
+    // Static headers — no sort arrow, no dynamic label rewrites
+    // (FORMAT stays "FORMAT" even when sorting cycles its priority
+    // lead). Clicking the cell still drives `controller.setSort`,
+    // the visible header just doesn't reflect sort state. Keeps
+    // the header row stable and readable; sort state is conveyed
+    // by the row order itself.
+    final inner = InkWell(
+      onTap: () => controller.setSort(column),
+      hoverColor: AppColors.hoverRow,
+      focusColor: AppColors.focusOverlay,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisAlignment: mainAlign,
+          children: [
+            Flexible(
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                textAlign: align,
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  letterSpacing: 1.0,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    // FORMAT cycles through 10 sort leads (4 singles + 6 pair
+    // combos) with no visible mode indicator — by spec, the header
+    // text stays static. The tooltip surfaces the active lead on
+    // hover so the user can tell pair-lead "interleaving" (which
+    // is correct per family-clustering rules) from being on the
+    // wrong lead. Other columns don't have hidden sort state, so
+    // they don't need a tooltip.
+    if (column == TrackSortColumn.format &&
+        controller.sortColumn == TrackSortColumn.format) {
+      return Tooltip(
+        message: 'Sort lead: ${controller.sortFormatLead}',
+        waitDuration: const Duration(milliseconds: 400),
+        child: inner,
+      );
+    }
+    return inner;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Column iteration helpers — used by both _TableHeader and _TrackRow so the
+// dynamic column order from the controller drives layout in one place.
+// ---------------------------------------------------------------------------
+
+double _columnWidth(String col, LibraryController c) {
+  switch (col) {
+    case 'fav':
+      return c.colFavWidth;
+    case 'rev':
+      return c.colRevWidth;
+    case 'title':
+      return c.colTitleWidth;
+    case 'artist':
+      return c.colArtistWidth;
+    case 'bpm':
+      return c.colBpmWidth;
+    case 'key':
+      return c.colKeyWidth;
+    case 'time':
+      return c.colTimeWidth;
+    case 'format':
+      return c.colFormatWidth;
+    case 'plays':
+      return c.colPlaysWidth;
+    case 'lastPlayed':
+      return c.colLastPlayedWidth;
+  }
+  return 0;
+}
+
+bool _isResizableColumn(String col) =>
+    col == 'title' || col == 'artist';
+
+Widget _buildHeaderInner(String col, LibraryController c) {
+  switch (col) {
+    case 'fav':
+      return _HeaderCell(
+        label: '★',
+        column: TrackSortColumn.favorite,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'rev':
+      return _HeaderCell(
+        label: 'REV',
+        column: TrackSortColumn.reviewed,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'title':
+      return _HeaderCell(
+        label: 'TITLE',
+        column: TrackSortColumn.title,
+        controller: c,
+        align: TextAlign.left,
+      );
+    case 'artist':
+      return _HeaderCell(
+        label: 'ARTIST',
+        column: TrackSortColumn.artist,
+        controller: c,
+        align: TextAlign.left,
+      );
+    case 'bpm':
+      return _HeaderCell(
+        label: 'BPM',
+        column: TrackSortColumn.bpm,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'key':
+      return _HeaderCell(
+        label: 'KEY',
+        column: TrackSortColumn.key,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'time':
+      return _HeaderCell(
+        label: 'TIME',
+        column: TrackSortColumn.duration,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'format':
+      return _HeaderCell(
+        label: 'FORMAT',
+        column: TrackSortColumn.format,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'plays':
+      return _HeaderCell(
+        label: 'PLAYS',
+        column: TrackSortColumn.plays,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'lastPlayed':
+      return _HeaderCell(
+        label: 'LAST',
+        column: TrackSortColumn.lastPlayed,
+        controller: c,
+        align: TextAlign.center,
+      );
+  }
+  return const SizedBox.shrink();
+}
+
+Widget _buildRowInner(
+  String col,
+  Track t,
+  LibraryController c, {
+  required bool isCurrent,
+  required bool isJustReviewed,
+  required bool isLoading,
+  required bool showArtwork,
+  required Color titleColor,
+  required FontWeight titleWeight,
+}) {
+  // When grouping by song identity is on, primary rows render
+  // aggregated values across their bucket. `aggView` is non-null
+  // only for primaries — single-variant or ungrouped rows fall
+  // through to the underlying Track fields.
+  final aggView = c.aggregatedViewForPrimary(t);
+  final favorite = aggView?.favorite ?? t.favorite;
+  final reviewed = aggView?.reviewed ?? t.reviewed;
+
+  switch (col) {
+    case 'fav':
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: _IconAction(
+            tooltip: favorite ? 'Unfavorite' : 'Favorite',
+            icon: favorite
+                ? Icons.star_rounded
+                : Icons.star_border_rounded,
+            color: favorite
+                ? AppColors.favorite
+                : AppColors.textSecondary,
+            onPressed: () => c.toggleFavorite(t.uid),
+          ),
+        ),
+      );
+    case 'rev':
+      // Filled disc when the threshold has been crossed; hollow
+      // ring when not. The disc reads as a *state* glyph rather
+      // than a "task completed" check, so it scans faster in a
+      // dense table.
+      //
+      // When `isJustReviewed` is true — the moment this track's
+      // play session crossed the threshold, still active until
+      // the next track plays — the disc participates in the row
+      // flash: brighter colour + ~15% scale-up. Animations match
+      // the row's 500 ms AnimatedContainer cadence so the REV
+      // cell + row pulse together as one moment. After the
+      // marker clears the disc decays back to its long-term
+      // appearance (still filled if the track is permanently
+      // reviewed; hollow otherwise).
+      final glyph = reviewed ? '●' : '○';
+      final baseColor = reviewed
+          ? AppColors.reviewed
+          : AppColors.textTertiary;
+      // Brighter accent for the active moment. Blends accent
+      // toward white so the disc visibly "lifts" against its
+      // normal hue, working whether the row was previously
+      // reviewed or not.
+      final activeColor =
+          Color.alphaBlend(Colors.white.withValues(alpha: 0.35), baseColor);
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: AnimatedScale(
+            scale: isJustReviewed ? 1.15 : 1.0,
+            duration: const Duration(milliseconds: 500),
+            curve: Curves.easeOut,
+            child: AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 500),
+              curve: Curves.easeOut,
+              style: TextStyle(
+                fontSize: 16,
+                height: 1.0,
+                fontWeight: FontWeight.w600,
+                color: isJustReviewed ? activeColor : baseColor,
+              ),
+              child: Text(glyph),
+            ),
+          ),
+        ),
+      );
+    case 'title':
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: _TitleCell(
+            track: t,
+            isCurrent: isCurrent,
+            isLoading: isLoading,
+            showArtwork: showArtwork,
+            titleColor: titleColor,
+            titleWeight: titleWeight,
+            variants: (aggView != null && aggView.titleDivergent)
+                ? aggView.variants
+                : null,
+          ),
+        ),
+      );
+    case 'artist':
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: _ArtistCell(
+            track: t,
+            variants: (aggView != null && aggView.artistDivergent)
+                ? aggView.variants
+                : null,
+            isCurrent: isCurrent,
+          ),
+        ),
+      );
+    case 'bpm':
+      final bpm = aggView?.bpm ?? t.bpm;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(child: Text(_formatBpm(bpm), style: _numStyle)),
+      );
+    case 'key':
+      // displayKey hits a per-Track cache; the underlying parser
+      // is regex-on-basename and does no I/O, so this is cheap
+      // even at 60fps with ~50 visible rows. When the row is a
+      // bucket primary, the aggregated `displayKey` enforces the
+      // blank-on-disagreement rule per project memory.
+      final key = aggView?.displayKey ?? t.displayKey;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(
+            key.isEmpty ? '—' : key,
+            style: key.isEmpty ? _numStyleDim : _numStyle,
+          ),
+        ),
+      );
+    case 'time':
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(_formatDuration(t.duration), style: _numStyle),
+        ),
+      );
+    case 'format':
+      // Plain text in all cases: aggregated `MP3 · AIFF` when the
+      // row is a multi-variant primary, single format label
+      // otherwise. The user reaches the individual variants via
+      // the right-click "Show in Finder" submenu — no inline
+      // expand/collapse here.
+      final fmt = aggView?.formatLabel ?? fileFormatLabel(t.filename);
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(
+            fmt.isEmpty ? '—' : fmt,
+            style: fmt.isEmpty ? _numStyleDim : _numStyle,
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
+          ),
+        ),
+      );
+    case 'plays':
+      final plays = aggView?.playCount ?? t.playCount;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(child: Text('$plays', style: _numStyle)),
+      );
+    case 'lastPlayed':
+      // `_formatLastPlayed` returns short numeric M/D/YY (e.g.
+      // "5/14/25") or "—" when never played. Sort comparator
+      // works on `lastPlayedAt` directly — no string parsing.
+      final at = aggView?.lastPlayedAt ?? t.lastPlayedAt;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(
+            _formatLastPlayed(at),
+            style: at == null ? _numStyleDim : _numStyle,
+          ),
+        ),
+      );
+  }
+  return const SizedBox.shrink();
+}
+
+Widget _buildHeaderGap(String col, LibraryController c) {
+  if (_isResizableColumn(col)) {
+    return _ResizeHandle(
+      onDelta: (dx, {bool commit = false}) => c.setColumnWidth(
+        col,
+        _columnWidth(col, c) + dx,
+        commit: commit,
+      ),
+    );
+  }
+  return const _ColumnDivider();
+}
+
+/// Wraps a header cell so it can be picked up via long-press and dropped
+/// onto another column to reorder. The DragTarget shows an accent
+/// insertion bar on its left edge while a drag hovers, providing a
+/// "nudging into a drop position" cue. On drop, `controller.moveColumn`
+/// commits the new order — `AnimatedPositioned` then slides every cell
+/// to its new x smoothly.
+class _DraggableHeaderCell extends StatelessWidget {
+  final String column;
+  final double width;
+  final LibraryController controller;
+  final Widget child;
+
+  const _DraggableHeaderCell({
+    required this.column,
+    required this.width,
+    required this.controller,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<String>(
+      onWillAcceptWithDetails: (d) => d.data != column,
+      onAcceptWithDetails: (d) {
+        final order = controller.columnOrder;
+        final myIdx = order.indexOf(column);
+        if (myIdx < 0) return;
+        controller.moveColumn(d.data, myIdx);
+      },
+      builder: (ctx, candidate, rejected) {
+        final dragOver = candidate.isNotEmpty;
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Positioned.fill(
+              // Draggable with horizontal affinity: a horizontal drag
+              // gesture (movement past Flutter's touch slop) immediately
+              // starts the column drag — no hold required. A pure click
+              // with no movement passes through to the InkWell beneath
+              // for sort. Vertical pointer activity (e.g., trackpad
+              // scroll) doesn't trigger drag.
+              child: Draggable<String>(
+                data: column,
+                affinity: Axis.horizontal,
+                feedback: Material(
+                  color: Colors.transparent,
+                  child: Container(
+                    width: width,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: AppColors.surface,
+                      border: Border.all(
+                        color: AppColors.accent,
+                        width: 1,
+                      ),
+                      borderRadius: BorderRadius.zero,
+                    ),
+                    child: child,
+                  ),
+                ),
+                childWhenDragging: Opacity(opacity: 0.3, child: child),
+                child: child,
+              ),
+            ),
+            // Insertion indicator: 3 px accent line nudged just outside
+            // the cell's left edge so it visually represents the gap
+            // between the dragged column's future neighbours rather
+            // than a border on this cell.
+            if (dragOver)
+              const Positioned(
+                left: -3,
+                top: -2,
+                bottom: -2,
+                child: SizedBox(
+                  width: 3,
+                  child: ColoredBox(color: AppColors.accent),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _TrackRow extends StatelessWidget {
+  final Track track;
+  final LibraryController controller;
+  final bool showArtwork;
+
+  const _TrackRow({
+    super.key,
+    required this.track,
+    required this.controller,
+    required this.showArtwork,
+  });
+
+  /// Primary click behaviour, modifier-aware:
+  ///   - Cmd/Ctrl+click → toggle this row in the batch selection.
+  ///   - Shift+click    → extend the batch selection from the anchor.
+  ///   - plain click    → clear any batch selection and audition the
+  ///     track (preserves the digging flow — a bare click always
+  ///     plays, never leaves a lingering multi-select).
+  void _handleTap() {
+    final kb = HardwareKeyboard.instance;
+    final additive = kb.isMetaPressed || kb.isControlPressed;
+    final range = kb.isShiftPressed;
+    if (additive) {
+      controller.toggleBatchSelection(track.uid);
+    } else if (range) {
+      controller.selectBatchRangeTo(track.uid);
+    } else {
+      if (controller.hasBatchSelection) controller.clearBatchSelection();
+      controller.play(track.uid, path: track.path);
+    }
+  }
+
+  /// Selection-scoped context menu shown when the right-clicked row is
+  /// part of a multi-row batch selection. Actions here operate on the
+  /// whole selection, resolved fresh from the controller at click time.
+  Future<void> _showBatchContextMenu(
+    BuildContext context,
+    Offset position,
+    RenderBox overlayBox,
+  ) async {
+    final count = controller.batchSelectionCount;
+    final destinations = controller.moveCopyDestinationsFor(track);
+    final hasDest = destinations.isNotEmpty;
+
+    final items = <PopupMenuEntry<String>>[
+      PopupMenuItem<String>(
+        value: 'batch-move-copy',
+        enabled: hasDest,
+        height: 40,
+        child: Row(
+          children: [
+            const Icon(Icons.drive_file_move_rounded,
+                size: 16, color: AppColors.textSecondary),
+            const SizedBox(width: 10),
+            Text(
+              hasDest
+                  ? 'Move or copy $count tracks…'
+                  : 'No folders to move/copy into',
+              style: const TextStyle(
+                  color: AppColors.textPrimary, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+      const PopupMenuDivider(height: 1),
+      PopupMenuItem<String>(
+        value: 'batch-clear',
+        height: 40,
+        child: Row(
+          children: [
+            const Icon(Icons.deselect_rounded,
+                size: 16, color: AppColors.textSecondary),
+            const SizedBox(width: 10),
+            Text(
+              'Clear selection ($count)',
+              style: const TextStyle(
+                  color: AppColors.textSecondary, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    ];
+
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromPoints(position, position),
+        Offset.zero & overlayBox.size,
+      ),
+      color: AppColors.surface,
+      elevation: 6,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.zero,
+        side: const BorderSide(color: AppColors.border),
+      ),
+      constraints: const BoxConstraints(maxWidth: 480),
+      items: items,
+    );
+
+    if (result == 'batch-clear') {
+      controller.clearBatchSelection();
+      return;
+    }
+    if (result == 'batch-move-copy' && context.mounted) {
+      final tracks = controller.batchSelectedTracks();
+      if (tracks.isEmpty) return;
+      final outcome = await showBatchMoveCopyDialog(
+        context: context,
+        controller: controller,
+        tracks: tracks,
+      );
+      if (!context.mounted || outcome == null || !outcome.hasAnyResult) {
+        return;
+      }
+      _showBatchOutcomeSnackBar(context, outcome);
+    }
+  }
+
+  void _showBatchOutcomeSnackBar(
+    BuildContext context,
+    BatchMoveCopyResult outcome,
+  ) {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    final verb = outcome.wasMove ? 'Moved' : 'Copied';
+    final destPart = outcome.succeededDestNames.length == 1
+        ? '→ ${outcome.succeededDestNames.first}'
+        : '→ ${outcome.succeededDestNames.length} folders';
+    final String text;
+    Color? bg;
+    if (outcome.failed == 0) {
+      text = '$verb ${outcome.succeeded} '
+          '${outcome.succeeded == 1 ? "file" : "files"} $destPart';
+    } else if (outcome.succeeded == 0) {
+      text = '${outcome.wasMove ? "Move" : "Copy"} failed for all '
+          '${outcome.failed}: ${outcome.failures.first.reason}';
+      bg = AppColors.favorite;
+    } else {
+      text = '$verb ${outcome.succeeded}, failed ${outcome.failed}: '
+          '${outcome.failures.first.reason}';
+      bg = AppColors.favorite;
+    }
+    messenger.showSnackBar(SnackBar(
+      content: Text(text),
+      backgroundColor: bg,
+      duration: Duration(seconds: outcome.failed == 0 ? 3 : 5),
+    ));
+  }
+
+  Future<void> _showContextMenu(BuildContext context, Offset position) async {
+    final overlayState = Overlay.of(context);
+    final overlayBox = overlayState.context.findRenderObject() as RenderBox;
+
+    // Batch mode: right-clicking a row that's part of a multi-row
+    // selection swaps the per-row menu for a selection-scoped one, so
+    // the actions unambiguously refer to "all N selected" rather than
+    // the single row under the cursor. Right-clicking OUTSIDE the
+    // selection falls through to the normal single-row menu below.
+    if (controller.batchSelectionCount > 1 &&
+        controller.isBatchSelected(track.uid)) {
+      await _showBatchContextMenu(context, position, overlayBox);
+      return;
+    }
+
+    // Multi-variant rows surface a per-format reveal item ("Show MP3
+    // in Finder", "Show AIFF in Finder", …) so the user picks
+    // exactly which file to open. Single-variant rows keep the old
+    // flat "Show in Finder" item with its currently-playing
+    // override + fallback semantics.
+    final aggView = controller.aggregatedViewForPrimary(track);
+    // Hide unavailable variants from the reveal menu so a file the
+    // user deleted in Finder (and that's been picked up by the
+    // filesystem watcher → marked `is_available = 0` on the next
+    // rescan) doesn't sit there inviting a no-op click.
+    final variants = (aggView != null && aggView.hasSiblings)
+        ? aggView.variants.where((t) => t.isAvailable).toList()
+        : const <Track>[];
+
+    final items = <PopupMenuEntry<String>>[];
+    if (variants.isEmpty) {
+      items.add(_revealMenuItem(value: 'reveal', label: 'Show in Finder'));
+    } else {
+      // Multi-variant rows: every reveal item gets a per-file
+      // disambiguator so two `Show MP3 in Finder` items don't read
+      // identically. Default disambiguator is the parent folder
+      // name (covers the typical cross-folder duplicate). When two
+      // variants of the SAME format share a parent folder (two MP3
+      // copies in one directory, original + Cmd+D " copy" side by
+      // side), fall back to the filename — guaranteed unique
+      // within a single directory.
+      final disambiguators =
+          _buildRevealDisambiguators(variants);
+      for (var i = 0; i < variants.length; i++) {
+        final v = variants[i];
+        final format = fileFormatLabel(v.filename);
+        final formatLabel =
+            format.isEmpty ? 'variant ${i + 1}' : format;
+        final disamb = disambiguators[i];
+        final label = disamb == null
+            ? 'Show $formatLabel in Finder'
+            : 'Show $formatLabel in Finder — $disamb';
+        items.add(_revealMenuItem(value: 'reveal:$i', label: label));
+      }
+    }
+    items.add(const PopupMenuDivider(height: 1));
+    items.add(_linkMenuItem());
+    // UNLINK only meaningful when the row is the primary of a
+    // multi-variant bucket. Hidden on singletons.
+    if (aggView != null && aggView.hasSiblings) {
+      items.add(_unlinkMenuItem(variantCount: aggView.variantCount));
+    }
+    // Show variant metadata: only meaningful when the bucket has
+    // multiple variants AND at least one diverging field. The
+    // dialog also surfaces last-change-wins values per variant,
+    // so even non-diverging buckets *could* benefit, but for v1
+    // we keep the menu uncluttered and only offer it when the
+    // user is likely to want forensic detail (i.e., divergence
+    // exists).
+    if (aggView != null &&
+        aggView.hasSiblings &&
+        (aggView.titleDivergent || aggView.artistDivergent)) {
+      items.add(_showVariantMetadataMenuItem());
+    }
+    // View history — opens the per-row causal-inspection popup with
+    // the chronological event chain for this File Instance. Always
+    // available (the popup itself handles the "no events yet"
+    // empty state). Placed in the inspection group above Move/Copy
+    // so deliberate-action items stay clustered at the bottom of
+    // the menu.
+    items.add(_viewHistoryMenuItem());
+
+    // Move/Copy entry — single item that opens a modal picker.
+    // The old flat-list approach (one item per destination per
+    // action) didn't scale past 3-4 sources; this single entry
+    // routes to a dialog where the user picks the action (Copy
+    // or Move) and one or more destinations from a checkbox list.
+    // For multi-variant rows the dialog operates on the row's
+    // primary track; per-variant move/copy is a future refinement.
+    // Gate the menu entry on having at least one OTHER source —
+    // controller now returns the current source too (so the dialog
+    // can render it as disabled), but with only the current
+    // source the dialog has no actionable target.
+    final destinations = controller.moveCopyDestinationsFor(track);
+    final hasOtherDest = destinations.any((s) => s.id != track.sourceId);
+    if (hasOtherDest) {
+      items.add(const PopupMenuDivider(height: 1));
+      items.add(_moveCopyMenuItem(
+        value: 'move-copy',
+        label: 'Move or copy…',
+        icon: Icons.drive_file_move_rounded,
+      ));
+    }
+
+    // (Mobile-sync pin-to-device menu items removed 2026-06-07
+    // with the mobile-sync removal — see mobile-sync-archive branch.)
+
+    // Destructive group at the bottom, separated by its own divider
+    // so the eye sees a clear visual break between reorganisational
+    // actions (Move/Copy) and trash. Hidden on unavailable rows —
+    // there's nothing on disk to trash for a file the system
+    // already marked missing.
+    if (track.isAvailable) {
+      items.add(const PopupMenuDivider(height: 1));
+      items.add(_deleteMenuItem());
+    }
+
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromPoints(position, position),
+        Offset.zero & overlayBox.size,
+      ),
+      color: AppColors.surface,
+      elevation: 6,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.zero,
+        side: const BorderSide(color: AppColors.border),
+      ),
+      // Cap the menu width so long filename disambiguators truncate
+      // with ellipsis inside the item instead of expanding the menu
+      // to absurd widths. The tooltip on each item still surfaces
+      // the full label on hover.
+      constraints: const BoxConstraints(maxWidth: 480),
+      items: items,
+    );
+
+    if (result == null) return;
+    if (result == 'reveal') {
+      await controller.showTrackInstanceInFinder(track);
+    } else if (result.startsWith('reveal:')) {
+      final idx = int.parse(result.substring('reveal:'.length));
+      if (idx >= 0 && idx < variants.length) {
+        await controller.revealVariantInFinder(variants[idx]);
+      }
+    } else if (result == 'link' && context.mounted) {
+      final target = await showLinkTrackDialog(
+        context: context,
+        controller: controller,
+        origin: track,
+      );
+      if (target != null) {
+        await controller.linkTracks(track, target);
+      }
+    } else if (result == 'unlink' && context.mounted) {
+      final view = controller.aggregatedViewForPrimary(track);
+      if (view == null || !view.hasSiblings) return;
+      final confirmed = await _confirmUnlink(
+        context,
+        variantCount: view.variantCount,
+      );
+      if (confirmed == true) {
+        await controller.unlinkBucket(track);
+      }
+    } else if (result == 'show-variant-metadata' && context.mounted) {
+      final view = controller.aggregatedViewForPrimary(track);
+      if (view == null || !view.hasSiblings) return;
+      await showVariantMetadataDialog(
+        context: context,
+        view: view,
+      );
+    } else if (result == 'view-history' && context.mounted) {
+      await showTrackHistoryPopup(
+        context: context,
+        controller: controller,
+        track: track,
+      );
+    } else if (result == 'move-copy' && context.mounted) {
+      // Open the modal picker. It owns the action toggle (Copy /
+      // Move) and the destination checkbox list, and runs the
+      // controller calls itself. We only summarise the outcome
+      // here via SnackBar so the result is visible after the
+      // dialog dismisses.
+      final outcome = await showMoveCopyDialog(
+        context: context,
+        controller: controller,
+        track: track,
+      );
+      if (!context.mounted) return;
+      if (outcome == null || !outcome.hasAnyResult) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      if (outcome.failures.isEmpty) {
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              outcome.wasMove
+                  ? 'Moved → ${outcome.succeededDestNames.first}'
+                  : outcome.succeededDestNames.length == 1
+                      ? 'Copied → ${outcome.succeededDestNames.first}'
+                      : 'Copied → '
+                          '${outcome.succeededDestNames.length} folders',
+            ),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      } else if (outcome.succeededDestNames.isEmpty) {
+        // Everything failed — show the first failure reason. If
+        // the user wants to see all failures, the History panel
+        // surfaces nothing (failed ops don't write events) but a
+        // future enhancement could collect them in a side panel.
+        final f = outcome.failures.first;
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              outcome.failures.length == 1
+                  ? '${outcome.wasMove ? "Move" : "Copy"} failed: '
+                      '${f.reason}'
+                  : '${outcome.wasMove ? "Move" : "Copy"} failed '
+                      'for all ${outcome.failures.length} '
+                      'destinations. First: ${f.reason}',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      } else {
+        // Mixed: some destinations succeeded, others didn't.
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              '${outcome.wasMove ? "Moved" : "Copied"} to '
+              '${outcome.succeededDestNames.length}, failed '
+              '${outcome.failures.length}: '
+              '${outcome.failures.first.reason}',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    } else if (result == 'delete' && context.mounted) {
+      final decision = await showDeleteTrackDialog(
+        context: context,
+        controller: controller,
+        track: track,
+      );
+      if (decision == null) return;
+      if (!context.mounted) return;
+      final trashed = await controller.deleteTracksToTrash(decision);
+      if (!context.mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      if (trashed == decision.paths.length) {
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              trashed == 1
+                  ? 'Moved 1 file to Trash'
+                  : 'Moved $trashed files to Trash',
+            ),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      } else if (trashed == 0) {
+        // Trash failed for every target — surface the failure
+        // explicitly so the user doesn't think the action
+        // silently no-op'd.
+        messenger?.showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Move to Trash failed — check file permissions or restart',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      } else {
+        // Partial success: some files trashed, others failed.
+        // Common cause: one of the variants was already gone from
+        // disk between dialog open and Apply.
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              'Moved $trashed of ${decision.paths.length} files to Trash',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<bool?> _confirmUnlink(
+    BuildContext context, {
+    required int variantCount,
+  }) {
+    return showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.zero,
+          side: const BorderSide(color: AppColors.border),
+        ),
+        title: const Text(
+          'Unlink variants?',
+          style: TextStyle(
+            color: AppColors.textPrimary,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.4,
+          ),
+        ),
+        content: Text(
+          'This breaks the song-identity bucket of $variantCount '
+          'files into separate songs. Play count, favorite, and '
+          'review state will reset for all of them. File analysis '
+          '(BPM, key, duration) is kept.',
+          style: const TextStyle(
+            color: AppColors.textSecondary,
+            fontSize: 12,
+            height: 1.4,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.textSecondary,
+            ),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.favorite,
+            ),
+            child: const Text('Unlink'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Per-variant disambiguator strings for the right-click reveal
+  /// submenu. Each non-null entry is appended to its variant's menu
+  /// label so two `Show MP3 in Finder` items can't read identically.
+  ///
+  /// Rule, applied independently per format group:
+  ///   - default: parent folder name (covers the typical
+  ///     cross-folder duplicate, e.g. original in `House - MP3/`
+  ///     and copy in `Z CRATE/`).
+  ///   - if two variants of the same format share a parent folder,
+  ///     fall back to filename for all of that format's variants —
+  ///     filenames are guaranteed unique within a directory, so the
+  ///     menu items always end up distinct. Mixing parent-dir and
+  ///     filename within one format group would be jarring, so the
+  ///     fallback applies group-wide.
+  ///
+  /// Returns `null` for a variant when even the filename + parent
+  /// path produces no useful disambiguator (degenerate case).
+  Map<int, String?> _buildRevealDisambiguators(List<Track> variants) {
+    final formatGroups = <String, List<int>>{};
+    for (var i = 0; i < variants.length; i++) {
+      final fmt = fileFormatLabel(variants[i].filename);
+      formatGroups.putIfAbsent(fmt, () => []).add(i);
+    }
+
+    final out = <int, String?>{};
+    for (final indices in formatGroups.values) {
+      final parents = [
+        for (final i in indices) _parentDirName(variants[i].path),
+      ];
+      final hasParentCollision =
+          parents.toSet().length < parents.length;
+      for (var j = 0; j < indices.length; j++) {
+        final i = indices[j];
+        if (hasParentCollision) {
+          // Filenames are unique within a folder; use them.
+          out[i] = variants[i].filename;
+        } else {
+          final p = parents[j];
+          out[i] = p.isEmpty ? null : '$p/';
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Return the immediate parent folder of [path]. Returns `''`
+  /// when the path has no parent component (bare filename or
+  /// a root-level entry).
+  ///
+  /// `/Users/me/Music/House - MP3/song.mp3` → `House - MP3`
+  String _parentDirName(String path) {
+    final sep = Platform.pathSeparator;
+    final lastSep = path.lastIndexOf(sep);
+    if (lastSep <= 0) return '';
+    final parentPath = path.substring(0, lastSep);
+    final prevSep = parentPath.lastIndexOf(sep);
+    return prevSep < 0
+        ? parentPath
+        : parentPath.substring(prevSep + 1);
+  }
+
+  PopupMenuItem<String> _showVariantMetadataMenuItem() {
+    return const PopupMenuItem<String>(
+      value: 'show-variant-metadata',
+      height: 32,
+      child: Row(
+        children: [
+          Icon(
+            Icons.compare_arrows_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Show variant metadata…',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _moveCopyMenuItem({
+    required String value,
+    required String label,
+    required IconData icon,
+  }) {
+    return PopupMenuItem<String>(
+      value: value,
+      height: 32,
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: AppColors.textSecondary),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 12,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // _pinToPhoneMenuItem removed 2026-06-07 with the mobile-sync
+  // removal. See mobile-sync-archive branch.
+
+  PopupMenuItem<String> _deleteMenuItem() {
+    // Destructive action. Warning-tinted icon + label so the eye
+    // recognises it as different in intent from every other entry
+    // in the menu. Ellipsis on the label signals "this will ask
+    // first" — same convention as `Move or copy…` above.
+    return PopupMenuItem<String>(
+      value: 'delete',
+      height: 32,
+      child: Row(
+        children: const [
+          Icon(
+            Icons.delete_outline_rounded,
+            size: 14,
+            color: AppColors.favorite,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Move to Trash…',
+              style: TextStyle(
+                color: AppColors.favorite,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _viewHistoryMenuItem() {
+    return const PopupMenuItem<String>(
+      value: 'view-history',
+      height: 32,
+      child: Row(
+        children: [
+          Icon(
+            Icons.history_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'View history',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _unlinkMenuItem({required int variantCount}) {
+    return PopupMenuItem<String>(
+      value: 'unlink',
+      height: 32,
+      child: Row(
+        children: [
+          const Icon(
+            Icons.link_off_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Unlink $variantCount variants…',
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 12,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _linkMenuItem() {
+    return const PopupMenuItem<String>(
+      value: 'link',
+      height: 32,
+      child: Row(
+        children: [
+          Icon(
+            Icons.link_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Link with another song…',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _revealMenuItem({
+    required String value,
+    required String label,
+  }) {
+    return PopupMenuItem<String>(
+      value: value,
+      height: 32,
+      child: Tooltip(
+        message: label,
+        waitDuration: const Duration(milliseconds: 600),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.folder_open_rounded,
+              size: 14,
+              color: AppColors.textSecondary,
+            ),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 12,
+                ),
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Surface "currently playing" on a bucket's primary if any
+    // variant in its bucket is the current track — siblings never
+    // appear as their own rows, so the primary has to own the
+    // highlight on behalf of the whole bucket. When grouping is
+    // off, `aggregatedViewForPrimary` returns null and this
+    // reduces to a plain uid match.
+    final currentUid = controller.currentTrackUid;
+    bool isCurrent = currentUid != null && currentUid == track.uid;
+    if (!isCurrent && currentUid != null) {
+      final aggView = controller.aggregatedViewForPrimary(track);
+      if (aggView != null &&
+          aggView.hasSiblings &&
+          aggView.variants.any((v) => v.uid == currentUid)) {
+        isCurrent = true;
+      }
+    }
+    final isLoading = isCurrent && controller.isLoadingTrack;
+    final isSelected = !isCurrent && controller.selectedTrackUid == track.uid;
+    // Batch multi-select membership (Cmd/Shift+click). Rendered as a
+    // stronger accent wash + a left accent bar so a checked-for-bulk
+    // row reads distinctly from the single keyboard cursor.
+    final isBatchSelected = controller.isBatchSelected(track.uid);
+    // Transient "just reviewed" highlight: when this track's current
+    // play session crosses the threshold, the controller sets
+    // `justReviewedUid` to its uid. Stays set until the next track
+    // starts. AnimatedContainer below fades the colour in (=
+    // user-visible flash) and out (when the marker clears). The
+    // persistent "ever been reviewed" record stays in the REV cell's
+    // filled-disc glyph — this row treatment is purely momentary.
+    final isJustReviewed = controller.justReviewedUid != null &&
+        controller.justReviewedUid == track.uid;
+    final titleColor = isCurrent
+        ? AppColors.accent
+        : (track.isAvailable ? AppColors.textPrimary : AppColors.textTertiary);
+    final titleWeight = isCurrent ? FontWeight.w600 : FontWeight.w500;
+    final trailIndex = isCurrent ? null : controller.trailIndexOf(track.uid);
+    Color rowColor;
+    if (isCurrent && isJustReviewed) {
+      // Currently-playing AND just crossed threshold this session:
+      // an extra-warm wash on top of the playing highlight so the
+      // user sees "this is the one that just got logged."
+      rowColor = Color.alphaBlend(
+        AppColors.reviewed.withValues(alpha: 0.10),
+        AppColors.selectedRow,
+      );
+    } else if (isCurrent) {
+      rowColor = AppColors.selectedRow;
+    } else if (isJustReviewed) {
+      // Just crossed threshold but no longer the current track —
+      // shouldn't happen often (the marker clears on next play()),
+      // but defensive: keep the highlight until the marker clears.
+      rowColor = AppColors.reviewed.withValues(alpha: 0.08);
+    } else if (isBatchSelected) {
+      rowColor = AppColors.accent.withValues(alpha: 0.16);
+    } else if (isSelected) {
+      rowColor = AppColors.accent.withValues(alpha: 0.07);
+    } else {
+      rowColor = AppColors.trailTint(trailIndex) ?? Colors.transparent;
+    }
+
+    // Not-yet-enriched signal: a row whose metadata hasn't been
+    // read yet (newly discovered, or bytes-changed-since-last-read)
+    // reads as dimmed so the user can see at a glance which rows
+    // are "still being processed." The audio engine can still play
+    // them — duration / title / artist just come from filename
+    // heuristics until enrichment catches up. Fades to full
+    // opacity when `metadataReadAt` lands, on the same 500 ms
+    // curve as the threshold-flash row tint so it feels like
+    // part of the same animation language.
+    final readyOpacity = track.isReady ? 1.0 : 0.45;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onSecondaryTapDown: (details) =>
+          _showContextMenu(context, details.globalPosition),
+      // AnimatedContainer animates rowColor changes. The user-visible
+      // "flash" when a track crosses the threshold is this color
+      // transition fading in over ~500 ms; the highlight then stays
+      // until the next play() clears `justReviewedUid`, after which
+      // it fades back out over the same duration.
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeOut,
+        color: rowColor,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 500),
+          curve: Curves.easeOut,
+          opacity: readyOpacity,
+          child: Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: _handleTap,
+        hoverColor: AppColors.hoverRow,
+        focusColor: AppColors.focusOverlay,
+        child: Stack(
+          children: [
+            if (isCurrent || isBatchSelected)
+              Positioned(
+                left: 0,
+                top: 0,
+                bottom: 0,
+                child: SizedBox(
+                  width: isBatchSelected && !isCurrent ? 3 : 2,
+                  child: const ColoredBox(color: AppColors.accent),
+                ),
+              ),
+            Padding(
+              padding: EdgeInsets.zero,
+              child: Builder(
+                builder: (context) {
+                  final order = controller.columnOrder;
+                  const dividerWidth = 6.0;
+                  final rowHeight = showArtwork ? 56.0 : 44.0;
+
+                  // Rows use plain Positioned (no animation). The
+                  // header keeps `AnimatedPositioned` so the user
+                  // sees a smooth reorder during column drag — but
+                  // for the body, every visible row × 7 cells of
+                  // active AnimationController objects ticking
+                  // indefinitely was a sustained per-frame cost
+                  // even when nothing was being dragged. Snap
+                  // layout for body rows is dramatically cheaper
+                  // and visually indistinguishable when columns
+                  // aren't moving.
+                  final children = <Widget>[];
+                  var x = 0.0;
+
+                  for (var i = 0; i < order.length; i++) {
+                    final col = order[i];
+                    final w = _columnWidth(col, controller);
+
+                    children.add(Positioned(
+                      left: x,
+                      top: 0,
+                      height: rowHeight,
+                      width: w,
+                      child: _buildRowInner(
+                        col,
+                        track,
+                        controller,
+                        isCurrent: isCurrent,
+                        isJustReviewed: isJustReviewed,
+                        isLoading: isLoading,
+                        showArtwork: showArtwork,
+                        titleColor: titleColor,
+                        titleWeight: titleWeight,
+                      ),
+                    ));
+                    x += w;
+
+                    if (i < order.length - 1) {
+                      children.add(Positioned(
+                        left: x,
+                        top: 0,
+                        height: rowHeight,
+                        width: dividerWidth,
+                        child: const _ColumnDivider(alpha: 0.35),
+                      ));
+                      x += dividerWidth;
+                    }
+                  }
+
+                  // Trailing divider mirrors the header's closing edge.
+                  children.add(Positioned(
+                    left: x,
+                    top: 0,
+                    height: rowHeight,
+                    width: dividerWidth,
+                    child: const _ColumnDivider(alpha: 0.35),
+                  ));
+
+                  return SizedBox(
+                    height: rowHeight,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: children,
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+      ),
+      ),
+      ),
+    );
+  }
+}
+
+class _TitleCell extends StatefulWidget {
+  final Track track;
+  final bool isCurrent;
+  final bool isLoading;
+  final bool showArtwork;
+  final Color titleColor;
+  final FontWeight titleWeight;
+
+  /// The full variant list of the bucket — passed only when the
+  /// bucket has multiple variants AND they disagree on title.
+  /// When provided, the cell becomes interactive: tapping the
+  /// divergence marker cycles `displayedIndex` through the
+  /// variants, swapping the rendered title in place. The user
+  /// can read each variant's title without leaving the table.
+  ///
+  /// `null` (or single-element list) → cell renders [track]'s
+  /// title once with no cycling affordance, as before.
+  final List<Track>? variants;
+
+  const _TitleCell({
+    required this.track,
+    required this.isCurrent,
+    required this.isLoading,
+    required this.showArtwork,
+    required this.titleColor,
+    required this.titleWeight,
+    this.variants,
+  });
+
+  @override
+  State<_TitleCell> createState() => _TitleCellState();
+}
+
+class _TitleCellState extends State<_TitleCell> {
+  int _displayedIndex = 0;
+
+  @override
+  void didUpdateWidget(covariant _TitleCell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If the variant list shrank or its primary uid changed
+    // (e.g., a rescan re-bucketed), clamp the cycle index back
+    // into range so we don't dereference past the end.
+    final n = widget.variants?.length ?? 1;
+    if (_displayedIndex >= n) {
+      _displayedIndex = 0;
+    }
+  }
+
+  Track get _shownTrack {
+    final vs = widget.variants;
+    if (vs == null || vs.isEmpty) return widget.track;
+    return vs[_displayedIndex.clamp(0, vs.length - 1)];
+  }
+
+  void _cycle() {
+    final vs = widget.variants;
+    if (vs == null || vs.length < 2) return;
+    setState(() {
+      _displayedIndex = (_displayedIndex + 1) % vs.length;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final divergent = (widget.variants?.length ?? 1) > 1;
+    final core = _buildCore();
+    if (!divergent) return core;
+    final count = widget.variants!.length;
+    final shown = _displayedIndex + 1;
+    final row = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(child: core),
+        _DivergenceMarker(badge: '$shown/$count'),
+      ],
+    );
+    // Two-stage tap semantics per UX refinement (2026-05-11):
+    // "the multiple clicks on the track after it's playing do
+    // nothing — so clicking after it's playing should change to
+    // alt metadata info."
+    //
+    //   First click on a non-current row → propagate to the
+    //   row's play handler (no GestureDetector intercept).
+    //   Subsequent clicks once the row IS the loaded track →
+    //   cycle through variant titles.
+    //
+    // So we only wrap in GestureDetector when isCurrent. Until
+    // then the tap falls through to the row → play kicks in →
+    // row becomes current → next click cycles.
+    if (!widget.isCurrent) return row;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _cycle,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: row,
+      ),
+    );
+  }
+
+  Widget _buildCore() {
+    final track = _shownTrack;
+    final isCurrent = widget.isCurrent;
+    final isLoading = widget.isLoading;
+    final showArtwork = widget.showArtwork;
+    final titleColor = widget.titleColor;
+    final titleWeight = widget.titleWeight;
+    // Title text starts flush left so it lines up with the "TITLE"
+    // header label — no leading EQ-glyph slot or padding inside the
+    // cell itself. Album artwork (compact mode toggle) is the only
+    // optional leader. Row tinting handles "currently playing"
+    // visual indication; the EQ glyph would otherwise push title
+    // text out of alignment with the header.
+    //
+    // Per-row loading indicator: when this is the row whose audio
+    // file the engine is currently materialising (e.g. Dropbox
+    // download), show a small spinner in the cell so the user can
+    // see *which* track triggered the wait — a single spinner on
+    // the central play button isn't enough during fast browsing.
+    final Widget? missingPrefix = isLoading
+        ? const Padding(
+            padding: EdgeInsets.only(right: 6),
+            child: SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(
+                strokeWidth: 1.5,
+                valueColor:
+                    AlwaysStoppedAnimation<Color>(AppColors.accent),
+              ),
+            ),
+          )
+        : track.isAvailable
+        ? null
+        : const Tooltip(
+            message: 'File not found at last scan',
+            waitDuration: Duration(milliseconds: 600),
+            child: Padding(
+              padding: EdgeInsets.only(right: 6),
+              child: Icon(
+                Icons.warning_amber_rounded,
+                size: 12,
+                color: AppColors.textTertiary,
+              ),
+            ),
+          );
+
+    final shownTitle = track.displayTitle;
+    if (showArtwork) {
+      return Row(
+        children: [
+          TrackArtwork(
+            seed: shownTitle,
+            size: 36,
+            highlight: isCurrent,
+          ),
+          const SizedBox(width: 10),
+          ?missingPrefix,
+          Flexible(
+            child: Text(
+              shownTitle,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              style: TextStyle(
+                color: titleColor,
+                fontSize: 13,
+                fontWeight: titleWeight,
+                height: 1.0,
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+    if (missingPrefix != null) {
+      return Row(
+        children: [
+          missingPrefix,
+          Flexible(
+            child: Text(
+              shownTitle,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              style: TextStyle(
+                color: titleColor,
+                fontSize: 13,
+                fontWeight: titleWeight,
+                height: 1.0,
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+    return Text(
+      shownTitle,
+      overflow: TextOverflow.ellipsis,
+      maxLines: 1,
+      style: TextStyle(
+        color: titleColor,
+        fontSize: 13,
+        fontWeight: titleWeight,
+        height: 1.0,
+      ),
+    );
+  }
+}
+
+/// Artist column cell. Mirrors the title cell's pattern: render the
+/// artist text inline, append a small divergence marker when variants
+/// in the same bucket disagree on `displayArtist`. The reveal panel
+/// (sub-slice 2c) surfaces the per-variant values.
+class _ArtistCell extends StatefulWidget {
+  final Track track;
+
+  /// Full bucket-variant list passed only when the bucket has
+  /// multiple variants AND they disagree on artist. When provided,
+  /// the cell becomes interactive (cell-click cycles through each
+  /// variant's `displayArtist`). `null` / single-variant → static
+  /// render of [track]'s artist.
+  final List<Track>? variants;
+
+  /// Whether this row is the currently-loaded / playing track.
+  /// Two-stage tap rule (mirrors `_TitleCell`): cycle only fires
+  /// once the row is current; the first click on a non-current
+  /// row falls through to the row's play handler.
+  final bool isCurrent;
+
+  const _ArtistCell({
+    required this.track,
+    this.variants,
+    this.isCurrent = false,
+  });
+
+  @override
+  State<_ArtistCell> createState() => _ArtistCellState();
+}
+
+class _ArtistCellState extends State<_ArtistCell> {
+  int _displayedIndex = 0;
+
+  @override
+  void didUpdateWidget(covariant _ArtistCell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final n = widget.variants?.length ?? 1;
+    if (_displayedIndex >= n) _displayedIndex = 0;
+  }
+
+  Track get _shownTrack {
+    final vs = widget.variants;
+    if (vs == null || vs.isEmpty) return widget.track;
+    return vs[_displayedIndex.clamp(0, vs.length - 1)];
+  }
+
+  void _cycle() {
+    final vs = widget.variants;
+    if (vs == null || vs.length < 2) return;
+    setState(() {
+      _displayedIndex = (_displayedIndex + 1) % vs.length;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final track = _shownTrack;
+    final text = Text(
+      track.displayArtist.isEmpty ? '—' : track.displayArtist,
+      overflow: TextOverflow.ellipsis,
+      maxLines: 1,
+      style: TextStyle(
+        color: track.displayArtist.isEmpty
+            ? AppColors.textSecondary
+            : AppColors.textPrimary,
+        fontSize: 12,
+        height: 1.0,
+      ),
+    );
+    final divergent = (widget.variants?.length ?? 1) > 1;
+    if (!divergent) return text;
+    final count = widget.variants!.length;
+    final row = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(child: text),
+        _DivergenceMarker(badge: '${_displayedIndex + 1}/$count'),
+      ],
+    );
+    // Two-stage tap: first click on a non-current row falls
+    // through to the row's play handler; subsequent clicks once
+    // the row IS current cycle through the variants. See
+    // _TitleCell for the full rationale.
+    if (!widget.isCurrent) return row;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _cycle,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: row,
+      ),
+    );
+  }
+}
+
+/// Small inline marker telling the user that two or more variants in
+/// the current bucket disagree on this cell's field. When a [badge]
+/// is supplied (e.g., "1/2"), it shows the cycle position so the
+/// user can track which variant's value the cell is currently
+/// rendering. The cell that owns this marker is what handles the
+/// tap to cycle — the marker itself is visual.
+class _DivergenceMarker extends StatelessWidget {
+  final String? badge;
+
+  const _DivergenceMarker({this.badge});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: Tooltip(
+        message: badge == null
+            ? 'Variants disagree on this field'
+            : 'Variants disagree on this field — click to cycle '
+                '(showing $badge)',
+        waitDuration: const Duration(milliseconds: 400),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.warning_amber_rounded,
+              size: 11,
+              color: AppColors.favorite,
+            ),
+            if (badge != null) ...[
+              const SizedBox(width: 3),
+              Text(
+                badge!,
+                style: const TextStyle(
+                  color: AppColors.favorite,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _IconAction extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final Color color;
+  final VoidCallback onPressed;
+
+  const _IconAction({
+    required this.tooltip,
+    required this.icon,
+    required this.color,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 600),
+      child: InkResponse(
+        onTap: onPressed,
+        radius: 14,
+        containedInkWell: false,
+        child: Padding(
+          padding: const EdgeInsets.all(2),
+          child: Icon(icon, size: 18, color: color),
+        ),
+      ),
+    );
+  }
+}
+
+const _numStyle = TextStyle(
+  color: AppColors.textPrimary,
+  fontSize: 12,
+  height: 1.0,
+  fontFeatures: [FontFeature.tabularFigures()],
+);
+
+const _numStyleDim = TextStyle(
+  color: AppColors.textTertiary,
+  fontSize: 12,
+  height: 1.0,
+  fontFeatures: [FontFeature.tabularFigures()],
+);
+
+String _formatDuration(Duration d) {
+  if (d == Duration.zero) return '—';
+  final m = d.inMinutes;
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return '$m:$s';
+}
+
+String _formatBpm(double? bpm) {
+  if (bpm == null || bpm <= 0) return '—';
+  return bpm.round().toString();
+}
+
+/// Compact date+time label for the Last Played column.
+/// Format: "M/D/YY · H:MM AM/PM" (e.g. "5/14/25 · 8:42 PM").
+/// Pure function over `(at, now)` — no allocations beyond the
+/// returned String, no DateTime arithmetic per-frame beyond a few
+/// integer subtractions. Cheap enough at 60fps × ~50 visible rows.
+///
+/// The bullet separator (` · `) matches the meta-line rhythm used
+/// elsewhere (deck Now Playing, Review-missing detail line) so the
+/// column reads consistent with surrounding UI vocabulary.
+///
+/// 12-hour clock with AM/PM (no seconds, no 24-hour ambiguity).
+/// Hour has no leading zero; minute is always 2 digits. Midnight
+/// renders as `12:00 AM`, noon as `12:00 PM`.
+String _formatLastPlayed(DateTime? at) {
+  if (at == null) return '—';
+  final yy = (at.year % 100).toString().padLeft(2, '0');
+  final date = '${at.month}/${at.day}/$yy';
+  final hour24 = at.hour;
+  final hour12 = hour24 == 0
+      ? 12
+      : (hour24 > 12 ? hour24 - 12 : hour24);
+  final minute = at.minute.toString().padLeft(2, '0');
+  final ampm = hour24 < 12 ? 'AM' : 'PM';
+  return '$date · $hour12:$minute $ampm';
+}
