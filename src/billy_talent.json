@@ -1,0 +1,51 @@
+{
+  "name": "Billy Talent",
+  "savedAt": 1751976000000,
+  "show": {
+    "name": "Billy Talent",
+    "venue": "Rogers Arena",
+    "dates": "May 24 - Jun 1, 2026",
+    "dark": false,
+    "walls": [
+      {
+        "id": "wall_usc",
+        "name": "Upstage Center LED",
+        "looms": [
+          {
+            "id": "loom_usc_1",
+            "name": "Loom 1",
+            "power": [
+              { "id": "c_usc_p1", "label": "SOCA B", "type": "SOCA", "length": 100, "notes": "" },
+              { "id": "c_usc_p2", "label": "SOCA B", "type": "SOCA", "length": 50, "notes": "" }
+            ],
+            "data": [
+              { "id": "c_usc_d1", "label": "A1", "type": "CAT5", "length": 50, "notes": "" },
+              { "id": "c_usc_d2", "label": "A2", "type": "CAT5", "length": 50, "notes": "" },
+              { "id": "c_usc_d3", "label": "A3", "type": "CAT5", "length": 25, "notes": "" }
+            ]
+          },
+          {
+            "id": "loom_usc_2",
+            "name": "Loom 2",
+            "power": [
+              { "id": "c_usc_p3", "label": "SOCA C", "type": "SOCA", "length": 100, "notes": "" },
+              { "id": "c_usc_p4", "label": "SOCA C", "type": "SOCA", "length": 50, "notes": "" }
+            ],
+            "data": []
+          }
+        ],
+        "individual": [
+          { "id": "c_usc_i1", "label": "A8", "type": "CAT5", "length": 200, "notes": "To Processor Rack" },
+          { "id": "c_usc_i2", "label": "A9", "type": "CAT6", "length": 100, "notes": "Backup Run" },
+          { "id": "c_usc_i3", "label": "TRUE1 A", "type": "TRUE1", "length": 25, "notes": "Aux Power" }
+        ]
+      },
+      { "id": "wall_sr", "name": "Stage Right IMAG", "looms": [], "individual": [] },
+      { "id": "wall_sl", "name": "Stage Left IMAG", "looms": [], "individual": [] },
+      { "id": "wall_ds", "name": "Downstage LED", "looms": [], "individual": [] },
+      { "id": "wall_h1", "name": "LED Header 1", "looms": [], "individual": [] },
+      { "id": "wall_h2", "name": "LED Header 2", "looms": [], "individual": [] },
+      { "id": "wall_foh", "name": "FOH Wall", "looms": [], "individual": [] }
+    ]
+  }
+}

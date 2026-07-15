@@ -3,7 +3,7 @@ import {
   Cable, Plus, Trash2, Copy, X, Pencil, Check, ChevronDown, RotateCcw,
   ArrowUp, ArrowDown, Sun, Moon, ImagePlus, ClipboardPaste, Lock, Unlock, Maximize2, ZoomIn, ZoomOut, Undo2, Redo2,
   FolderOpen, Save, Download, Upload, Image as ImageIcon, Minus, GripVertical, BarChart3, Ruler, Tag,
-  Calendar, MapPin, Plug, Wrench, Package, LayoutGrid, Monitor, Move, Zap, Square, Info, Pin
+  Calendar, MapPin, Plug, Wrench, Package, LayoutGrid, Monitor, Move, Zap, Square, Info, Pin, Printer
 } from "lucide-react";
 
 // load the app's fonts (Archivo + IBM Plex) wherever it runs; harmless if blocked
@@ -3366,6 +3366,39 @@ export default function LoomBuilder() {
     }));
   }, [wall?.id]);
 
+  // like updateWall, but targets any wall by id — needed on the show-summary page,
+  // which renders every wall's card at once (not just the active one).
+  const updateWallById = useCallback((wallId, fn) => {
+    setShow((s) => ({
+      ...s,
+      walls: s.walls.map((w) => (w.id === wallId ? fn(structuredClone(w)) : w)),
+    }));
+  }, []);
+
+  const SUMMARY_SECTIONS = ["looms", "photos"];
+  const normalizeSummarySectionOrder = (arr) => {
+    const cur = (arr || []).filter((k) => SUMMARY_SECTIONS.includes(k));
+    SUMMARY_SECTIONS.forEach((k) => { if (!cur.includes(k)) cur.push(k); });
+    return cur;
+  };
+  const reorderSummarySections = (wallId, dragK, targetK) => updateWallById(wallId, (w) => {
+    const order = normalizeSummarySectionOrder(w.summarySectionOrder).filter((x) => x !== dragK);
+    const idx = order.indexOf(targetK);
+    order.splice(idx === -1 ? order.length : idx, 0, dragK);
+    w.summarySectionOrder = order;
+    return w;
+  });
+  const reorderLooms = (wallId, dragId, targetId) => updateWallById(wallId, (w) => {
+    const looms = [...(w.looms || [])];
+    const from = looms.findIndex((l) => l.id === dragId);
+    const to = looms.findIndex((l) => l.id === targetId);
+    if (from === -1 || to === -1 || from === to) return w;
+    const [moved] = looms.splice(from, 1);
+    looms.splice(to, 0, moved);
+    w.looms = looms;
+    return w;
+  });
+
   // repeat walls: one built wall counted N times in the show totals
   const setWallMult = (wallId, n) => setShow((s) => ({
     ...s,
@@ -3384,6 +3417,14 @@ export default function LoomBuilder() {
   });
 
   // ---- wall tab reordering (drag the tabs to shuffle) ----
+  const [collapsedWalls, setCollapsedWalls] = useState(() => new Set());   // summary: collapsed LED-section cards
+  const [collapsedLooms, setCollapsedLooms] = useState(() => new Set());   // summary: collapsed individual loom rows
+  const toggleCollapsedWall = (id) => setCollapsedWalls((cur) => {
+    const next = new Set(cur); next.has(id) ? next.delete(id) : next.add(id); return next;
+  });
+  const toggleCollapsedLoom = (id) => setCollapsedLooms((cur) => {
+    const next = new Set(cur); next.has(id) ? next.delete(id) : next.add(id); return next;
+  });
   const [wallDrag, setWallDrag] = useState(null);   // wall id being dragged
   const [wallOver, setWallOver] = useState(null);   // wall id currently hovered
 
@@ -3478,6 +3519,12 @@ export default function LoomBuilder() {
 
   // ---- Space Cable wizard ----
   const [spaceLoomId, setSpaceLoomId] = useState(null);
+  // show-summary card drag/drop: which block (LOOMS vs REFERENCE) sits on top per wall,
+  // and the loom order within the LOOMS block. Keyed by wallId so drags never cross cards.
+  const [summarySecDrag, setSummarySecDrag] = useState(null); // { wallId, key }
+  const [summarySecOver, setSummarySecOver] = useState(null); // { wallId, key }
+  const [loomDrag, setLoomDrag] = useState(null); // { wallId, loomId }
+  const [loomOver, setLoomOver] = useState(null); // { wallId, loomId }
   const spaceLoom = wall?.looms.find((l) => l.id === spaceLoomId) || null;
 
   const saveLoomSpacing = (loomId, spacing, xdLengths = null) => updateWall((w) => {
@@ -4085,10 +4132,81 @@ export default function LoomBuilder() {
   };
 
   const [exportText, setExportText] = useState(null);
+  const summaryRef = useRef(null);
+  const [pngPreview, setPngPreview] = useState(null); // { url, error } shown for manual save
+  const [pngBusy, setPngBusy] = useState(false);
+  const exportSummaryPng = async () => {
+    const node = summaryRef.current;
+    if (!node) return;
+    setPngBusy(true);
+    try {
+      const rect = { width: node.scrollWidth || node.clientWidth, height: node.scrollHeight || node.clientHeight };
+      const RS = 2; // rasterize the source at 2x for crisp text
+      const clone = node.cloneNode(true);
+      const wrap = document.createElement("div");
+      // force the light palette on the export regardless of on-screen theme
+      wrap.setAttribute("style", printVarsCss + ` width:${rect.width}px; background:#FAFAF8; font-family:'IBM Plex Sans','Segoe UI',system-ui,sans-serif;`);
+      wrap.appendChild(clone);
+      wrap.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+      const xml = new XMLSerializer().serializeToString(wrap);
+      // render the whole summary once, at 2x, into an off-screen image
+      const svgMarkup = `<svg xmlns="http://www.w3.org/2000/svg" width="${rect.width * RS}" height="${rect.height * RS}" viewBox="0 0 ${rect.width} ${rect.height}">`
+        + `<foreignObject width="${rect.width}" height="${rect.height}">${xml}</foreignObject></svg>`;
+      const svgUrl = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svgMarkup);
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve; img.onerror = () => reject(new Error("image load failed"));
+        img.src = svgUrl;
+      });
+
+      // A4 landscape page geometry at 150 DPI
+      const DPI = 150;
+      const PAGE_W = Math.round(11.69 * DPI); // 1754px  (297mm)
+      const PAGE_H = Math.round(8.27 * DPI);  // 1240px  (210mm)
+      const M = Math.round(0.28 * DPI);       // ~42px margin (~7mm)
+      const CW = PAGE_W - 2 * M;              // usable content width
+      const CH = PAGE_H - 2 * M;              // usable content height
+      const k = CW / rect.width;              // natural -> page scale (fit to A4 width)
+      const sliceNatural = CH / k;            // natural px that fill one page height
+      const pageCount = Math.min(40, Math.max(1, Math.ceil(rect.height / sliceNatural)));
+
+      const base = (show.name || "show").replace(/[^\w-]+/g, "_");
+      let firstUrl = null;
+      for (let p = 0; p < pageCount; p++) {
+        const nY0 = p * sliceNatural;
+        const nH = Math.min(sliceNatural, rect.height - nY0);
+        const canvas = document.createElement("canvas");
+        canvas.width = PAGE_W; canvas.height = PAGE_H;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#FAFAF8";
+        ctx.fillRect(0, 0, PAGE_W, PAGE_H);
+        // source slice (in the 2x-rasterized image) -> destination inside the page margins
+        ctx.drawImage(img,
+          0, nY0 * RS, rect.width * RS, nH * RS,
+          M, M, CW, nH * k);
+        const pngUrl = canvas.toDataURL("image/png");
+        if (p === 0) firstUrl = pngUrl;
+        const suffix = pageCount > 1 ? `_p${p + 1}of${pageCount}` : "";
+        try {
+          const a = document.createElement("a");
+          a.href = pngUrl; a.download = `${base}_summary${suffix}.png`;
+          document.body.appendChild(a); a.click(); a.remove();
+        } catch (e) { /* preview still shown below */ }
+        // small gap so the browser doesn't drop rapid multi-file downloads
+        if (pageCount > 1) await new Promise((r) => setTimeout(r, 250));
+      }
+      setPngPreview({ url: firstUrl, pages: pageCount });
+    } catch (e) {
+      setPngPreview({ error: e.message || "Export failed" });
+    } finally {
+      setPngBusy(false);
+    }
+  }; // JSON shown in a copy modal
   const exportProject = async () => {
     const json = JSON.stringify({ name: show.name, savedAt: Date.now(), show }, null, 2);
     const fname = `${(show.name || "show").replace(/[^\w-]+/g, "_")}.loomproject.json`;
     try {
+      // real browser: download an actual .loomproject.json file
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -4096,8 +4214,9 @@ export default function LoomBuilder() {
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (e) {
+      // fallback: copy to clipboard and show the modal
       let copied = false;
-      try { await navigator.clipboard.writeText(json); copied = true; } catch (e2) {}
+      try { await navigator.clipboard.writeText(json); copied = true; } catch (e2) { /* manual copy */ }
       setExportText({ json, copied });
     }
   };
@@ -4173,14 +4292,29 @@ export default function LoomBuilder() {
     </div>
   );
 
+  // print: force the light palette (readable on paper) regardless of the on-screen theme,
+  // and preserve background colors so the diagrams/chips still carry their color coding.
+  const printVarsCss = Object.entries(THEME_VARS.light).map(([k, v]) => `${k}: ${v} !important;`).join(" ");
+
   return (
     <div style={{
       ...vars, minHeight: "100vh", background: "var(--bg)", color: "var(--text)",
       fontFamily: "'IBM Plex Sans','Segoe UI',system-ui,sans-serif",
       transition: "background .2s ease, color .2s ease",
     }}>
+      <style>{`
+        @media print {
+          @page { size: landscape; margin: 8mm; }
+          * { ${printVarsCss} -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+          .no-print { display: none !important; }
+          .print-card { break-inside: avoid; page-break-inside: avoid; }
+          /* scale everything up for easy reading on paper: text, chips, and diagrams together */
+          .print-scale { zoom: 1.55; }
+          .print-scale svg text { font-weight: 800 !important; }
+        }
+      `}</style>
       {/* ---- header ---- */}
-      <div style={{
+      <div className="no-print" style={{
         background: "var(--header-bg)", color: "#fff", padding: "16px 24px",
         display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12,
       }}>
@@ -4373,7 +4507,8 @@ export default function LoomBuilder() {
       </div>
 
       {summaryView && (
-        <div style={{ padding: 24, display: "grid", gap: 24, maxWidth: 1050, margin: "0 auto" }}>
+        <div ref={summaryRef} className="print-scale" style={{ padding: 24, display: "grid", gap: 24, maxWidth: 1050, margin: "0 auto" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
           <div>
             <h1 style={{ fontFamily: "'Archivo','IBM Plex Sans',sans-serif", fontSize: 30, fontWeight: 800, margin: 0, letterSpacing: 0.6 }}>SHOW SUMMARY</h1>
             <div style={{ fontSize: 13, color: "var(--sub)", marginTop: 4 }}>
@@ -4382,9 +4517,21 @@ export default function LoomBuilder() {
               {showTotals.loomCount} loom{showTotals.loomCount !== 1 ? "s" : ""}
             </div>
           </div>
+          <div className="no-print" style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+            <Btn onClick={() => setCollapsedWalls(new Set(show.walls.map((w) => w.id)))}>
+              <ChevronDown size={13} style={{ transform: "rotate(-90deg)" }} /> Minimize All
+            </Btn>
+            <Btn onClick={() => setCollapsedWalls(new Set())}>
+              <ChevronDown size={13} /> Expand All
+            </Btn>
+            <Btn variant="primary" onClick={exportSummaryPng}>
+              {pngBusy ? "Exporting\u2026" : <><ImageIcon size={14} /> Export as PNG</>}
+            </Btn>
+          </div>
+          </div>
 
           {/* grand totals */}
-          <div style={{ ...card, padding: 18, borderTop: "5px solid var(--blue)", overflow: "hidden" }}>
+          <div className="print-card" style={{ ...card, padding: 18, borderTop: "5px solid var(--blue)", overflow: "hidden" }}>
             <div style={{
               display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8,
               margin: "-18px -18px 14px", padding: "13px 18px",
@@ -4460,22 +4607,64 @@ export default function LoomBuilder() {
             )}
           </div>
 
-          {/* one card per wall */}
+          {/* one card per wall — drag the grip to reorder LED sections */}
           {show.walls.map((w) => {
             const s = computeWallSummary(w);
+            const wallCardDragActive = !!wallDrag;
+            const wallCardIsOver = wallCardDragActive && wallOver === w.id && wallDrag !== w.id;
             return (
-              <div key={w.id} style={{ ...card, padding: 18, overflow: "hidden" }}>
+              <div key={w.id}
+                className="print-card"
+                onDragOver={(e) => {
+                  if (w.system || !wallCardDragActive || wallDrag === w.id) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  if (wallOver !== w.id) setWallOver(w.id);
+                }}
+                onDrop={(e) => {
+                  if (w.system) return;
+                  e.preventDefault();
+                  if (wallDrag && wallDrag !== w.id) reorderWalls(wallDrag, w.id);
+                  setWallDrag(null); setWallOver(null);
+                }}
+                style={{
+                  ...card, padding: 18, overflow: "hidden",
+                  opacity: wallDrag === w.id ? 0.4 : 1,
+                  outline: wallCardIsOver ? "2px solid var(--blue)" : "none", outlineOffset: 2,
+                }}>
                 <div style={{
                   display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8,
                   margin: "-18px -18px 14px", padding: "12px 18px",
                   background: "var(--thead)", borderBottom: "1px solid var(--border)",
                 }}>
-                  <div style={{ fontWeight: 800, fontSize: 14, color: w.system ? "var(--green)" : "var(--text)" }}>
-                    {w.name}
-                    {w.system && <span style={{ fontWeight: 600, fontSize: 10.5, color: "var(--faint)" }}> (SHOW-LEVEL)</span>}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <button className="no-print" onClick={() => toggleCollapsedWall(w.id)}
+                      title={collapsedWalls.has(w.id) ? "Expand this section" : "Minimize this section"}
+                      style={{
+                        display: "inline-flex", alignItems: "center", justifyContent: "center",
+                        width: 22, height: 22, border: "1px solid var(--border)", background: "var(--card)",
+                        color: "var(--sub)", cursor: "pointer", borderRadius: 0, padding: 0,
+                      }}>
+                      <ChevronDown size={13} style={{ transform: collapsedWalls.has(w.id) ? "rotate(-90deg)" : "none", transition: "transform .15s" }} />
+                    </button>
+                    {!w.system && (
+                      <span className="no-print" draggable title="Drag to reorder this LED section"
+                        onDragStart={(e) => {
+                          setWallDrag(w.id);
+                          try { e.dataTransfer.setData("text/plain", w.id); e.dataTransfer.effectAllowed = "move"; } catch {}
+                        }}
+                        onDragEnd={() => { setWallDrag(null); setWallOver(null); }}
+                        style={{ display: "inline-flex", alignItems: "center", cursor: "grab", color: "var(--faint)" }}>
+                        <GripVertical size={15} />
+                      </span>
+                    )}
+                    <div style={{ fontWeight: 800, fontSize: 14, color: w.system ? "var(--green)" : "var(--text)" }}>
+                      {w.name}
+                      {w.system && <span style={{ fontWeight: 600, fontSize: 10.5, color: "var(--faint)" }}> (SHOW-LEVEL)</span>}
+                    </div>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                    {!w.system && <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}
+                    {!w.system && <span className="no-print" style={{ display: "inline-flex", alignItems: "center", gap: 5 }}
                       title="Repeat walls: the show totals count this wall this many times">
                       <span style={{ fontSize: 10.5, fontWeight: 800, color: "var(--blue)", letterSpacing: 0.4 }}>REPEAT</span>
                       <button title="Fewer" onClick={() => setWallMult(w.id, (w.mult || 1) - 1)}
@@ -4493,13 +4682,17 @@ export default function LoomBuilder() {
                         <b style={{ color: "var(--blue)" }}> {"→ "}{s.total * (w.mult || 1)} in totals</b>
                       )}
                     </span>
-                    <Btn onClick={() => setActiveWallId(w.id)} style={{ padding: "4px 10px", fontSize: 11.5 }}>
-                      Open Wall
-                    </Btn>
+                    <span className="no-print" style={{ display: "contents" }}>
+                      <Btn onClick={() => setActiveWallId(w.id)} style={{ padding: "4px 10px", fontSize: 11.5 }}>
+                        Open Wall
+                      </Btn>
+                    </span>
                   </div>
                 </div>
+                {!collapsedWalls.has(w.id) && <>
                 <WallSummaryColumns w={w} s={s} />
                 {(() => {
+                  const __loomsBlock = (() => {
                   const looms = w.looms || [];
                   if (looms.length === 0) return null;
                   // build a per-loom breakdown: name, tags, and the cable tally like "CAT5 25′ ×4"
@@ -4515,26 +4708,117 @@ export default function LoomBuilder() {
                     return [...m.values()].sort((a, b) =>
                       a.type === b.type ? b.len - a.len : a.type.localeCompare(b.type));
                   };
+                  const secKey = "looms";
+                  const secDragActive = summarySecDrag && summarySecDrag.wallId === w.id;
+                  const secIsOver = secDragActive && summarySecOver
+                    && summarySecOver.wallId === w.id && summarySecOver.key === secKey
+                    && summarySecDrag.key !== secKey;
                   return (
-                    <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                    <div
+                      onDragOver={(e) => {
+                        if (!secDragActive || summarySecDrag.key === secKey) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                        if (!summarySecOver || summarySecOver.key !== secKey) setSummarySecOver({ wallId: w.id, key: secKey });
+                      }}
+                      onDragLeave={() => {
+                        if (summarySecOver && summarySecOver.wallId === w.id && summarySecOver.key === secKey) setSummarySecOver(null);
+                      }}
+                      onDrop={(e) => {
+                        if (!secDragActive || summarySecDrag.key === secKey) return;
+                        e.preventDefault();
+                        reorderSummarySections(w.id, summarySecDrag.key, secKey);
+                        setSummarySecDrag(null); setSummarySecOver(null);
+                      }}
+                      style={{
+                        marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 12,
+                        outline: secIsOver ? "2px solid var(--blue)" : "none", outlineOffset: 2,
+                      }}>
                       <div style={{
                         display: "flex", alignItems: "center", gap: 8, marginBottom: 8,
                         fontSize: 10.5, fontWeight: 800, letterSpacing: 1.2, color: "var(--sub)",
                       }}>
+                        <span className="no-print" draggable title="Drag to reorder this block above or below Reference"
+                          onDragStart={(e) => {
+                            setSummarySecDrag({ wallId: w.id, key: secKey });
+                            try { e.dataTransfer.setData("text/plain", secKey); e.dataTransfer.effectAllowed = "move"; } catch {}
+                          }}
+                          onDragEnd={() => { setSummarySecDrag(null); setSummarySecOver(null); }}
+                          style={{
+                            display: "inline-flex", alignItems: "center", cursor: "grab",
+                            color: "var(--faint)", marginRight: -2,
+                          }}>
+                          <GripVertical size={13} />
+                        </span>
                         LOOMS <span style={{ color: "var(--faint)", fontWeight: 700 }}>{"\u00b7"} {looms.length}</span>
+                        <span className="no-print" style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                          <button onClick={() => setCollapsedLooms((cur) => new Set([...cur, ...looms.map((l) => l.id)]))}
+                            style={{
+                              fontSize: 9.5, fontWeight: 800, padding: "3px 8px", cursor: "pointer",
+                              border: "1px solid var(--border)", background: "var(--card)", color: "var(--sub)",
+                              fontFamily: "inherit", borderRadius: 0, letterSpacing: 0.4,
+                            }}>MINIMIZE ALL</button>
+                          <button onClick={() => setCollapsedLooms((cur) => {
+                              const next = new Set(cur); looms.forEach((l) => next.delete(l.id)); return next;
+                            })}
+                            style={{
+                              fontSize: 9.5, fontWeight: 800, padding: "3px 8px", cursor: "pointer",
+                              border: "1px solid var(--border)", background: "var(--card)", color: "var(--sub)",
+                              fontFamily: "inherit", borderRadius: 0, letterSpacing: 0.4,
+                            }}>EXPAND ALL</button>
+                        </span>
                       </div>
                       <div style={{ display: "grid", gap: 8 }}>
                         {looms.map((lm) => {
                           const cables = [...(lm.data || []), ...(lm.power || [])];
                           const rows = tallyOf(cables);
                           const isXd = !!lm.xdBox;
+                          const loomDragActive = loomDrag && loomDrag.wallId === w.id;
+                          const loomIsOver = loomDragActive && loomOver
+                            && loomOver.wallId === w.id && loomOver.loomId === lm.id
+                            && loomDrag.loomId !== lm.id;
                           return (
-                            <div key={lm.id} style={{
-                              border: "1px solid var(--border)",
-                              borderLeft: `4px solid ${isXd ? "var(--cat6)" : "var(--blue)"}`,
-                              padding: "8px 10px", background: "var(--card)",
-                            }}>
-                              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: rows.length ? 6 : 0 }}>
+                            <div key={lm.id}
+                              onDragOver={(e) => {
+                                if (!loomDragActive || loomDrag.loomId === lm.id) return;
+                                e.preventDefault();
+                                e.dataTransfer.dropEffect = "move";
+                                if (!loomOver || loomOver.loomId !== lm.id) setLoomOver({ wallId: w.id, loomId: lm.id });
+                              }}
+                              onDragLeave={() => {
+                                if (loomOver && loomOver.wallId === w.id && loomOver.loomId === lm.id) setLoomOver(null);
+                              }}
+                              onDrop={(e) => {
+                                if (!loomDragActive || loomDrag.loomId === lm.id) return;
+                                e.preventDefault();
+                                reorderLooms(w.id, loomDrag.loomId, lm.id);
+                                setLoomDrag(null); setLoomOver(null);
+                              }}
+                              style={{
+                                border: "1px solid var(--border)",
+                                borderLeft: `4px solid ${isXd ? "var(--cat6)" : "var(--blue)"}`,
+                                padding: "8px 10px", background: "var(--card)",
+                                outline: loomIsOver ? "2px solid var(--blue)" : "none", outlineOffset: 1,
+                              }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: (rows.length && !collapsedLooms.has(lm.id)) ? 6 : 0 }}>
+                                <button className="no-print" onClick={() => toggleCollapsedLoom(lm.id)}
+                                  title={collapsedLooms.has(lm.id) ? "Expand this loom" : "Minimize this loom"}
+                                  style={{
+                                    display: "inline-flex", alignItems: "center", justifyContent: "center",
+                                    width: 18, height: 18, border: "1px solid var(--border)", background: "var(--card)",
+                                    color: "var(--sub)", cursor: "pointer", borderRadius: 0, padding: 0, flexShrink: 0,
+                                  }}>
+                                  <ChevronDown size={11} style={{ transform: collapsedLooms.has(lm.id) ? "rotate(-90deg)" : "none", transition: "transform .15s" }} />
+                                </button>
+                                <span className="no-print" draggable title="Drag to reorder this loom"
+                                  onDragStart={(e) => {
+                                    setLoomDrag({ wallId: w.id, loomId: lm.id });
+                                    try { e.dataTransfer.setData("text/plain", lm.id); e.dataTransfer.effectAllowed = "move"; } catch {}
+                                  }}
+                                  onDragEnd={() => { setLoomDrag(null); setLoomOver(null); }}
+                                  style={{ display: "inline-flex", alignItems: "center", cursor: "grab", color: "var(--faint)" }}>
+                                  <GripVertical size={13} />
+                                </span>
                                 <span style={{ fontSize: 12.5, fontWeight: 800, color: "var(--text)" }}>{lm.name}</span>
                                 {isXd && (
                                   <span style={{
@@ -4547,13 +4831,15 @@ export default function LoomBuilder() {
                                 <span style={{ marginLeft: "auto", fontSize: 11, fontWeight: 700, color: "var(--sub)" }}>
                                   {cables.length} cable{cables.length !== 1 ? "s" : ""}
                                 </span>
-                                <Btn onClick={() => { setActiveWallId(w.id); setSummaryView(false); setSpaceLoomId(lm.id); }}
-                                  style={{ padding: "3px 8px", fontSize: 10.5 }}
-                                  title="Open the Space Cable diagram for this loom">
-                                  Open Diagram
-                                </Btn>
+                                <span className="no-print" style={{ display: "contents" }}>
+                                  <Btn onClick={() => { setActiveWallId(w.id); setSummaryView(false); setSpaceLoomId(lm.id); }}
+                                    style={{ padding: "3px 8px", fontSize: 10.5 }}
+                                    title="Open the Space Cable diagram for this loom">
+                                    Open Diagram
+                                  </Btn>
+                                </span>
                               </div>
-                              {rows.length > 0 && (
+                              {rows.length > 0 && !collapsedLooms.has(lm.id) && (
                                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
                                   {rows.map((r, i) => {
                                     const tc = (typeof TYPE_COLORS !== "undefined" && TYPE_COLORS[r.type])
@@ -4569,15 +4855,15 @@ export default function LoomBuilder() {
                                   })}
                                 </div>
                               )}
-                              <LoomBuildDiagram loom={lm} wallSpacing={w.spacing} />
+                              {!collapsedLooms.has(lm.id) && <LoomBuildDiagram loom={lm} wallSpacing={w.spacing} />}
                             </div>
                           );
                         })}
                       </div>
                     </div>
                   );
-                })()}
-                {(() => {
+                  })();
+                  const __photosBlock = (() => {
                   const photos = w.photos || [];
                   if (photos.length === 0) return null;
                   // put the pinned photo first if there is one
@@ -4586,12 +4872,48 @@ export default function LoomBuilder() {
                     if (b.id === w.pinnedPhoto) return 1;
                     return 0;
                   });
+                  const secKey = "photos";
+                  const secDragActive = summarySecDrag && summarySecDrag.wallId === w.id;
+                  const secIsOver = secDragActive && summarySecOver
+                    && summarySecOver.wallId === w.id && summarySecOver.key === secKey
+                    && summarySecDrag.key !== secKey;
                   return (
-                    <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+                    <div
+                      onDragOver={(e) => {
+                        if (!secDragActive || summarySecDrag.key === secKey) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                        if (!summarySecOver || summarySecOver.key !== secKey) setSummarySecOver({ wallId: w.id, key: secKey });
+                      }}
+                      onDragLeave={() => {
+                        if (summarySecOver && summarySecOver.wallId === w.id && summarySecOver.key === secKey) setSummarySecOver(null);
+                      }}
+                      onDrop={(e) => {
+                        if (!secDragActive || summarySecDrag.key === secKey) return;
+                        e.preventDefault();
+                        reorderSummarySections(w.id, summarySecDrag.key, secKey);
+                        setSummarySecDrag(null); setSummarySecOver(null);
+                      }}
+                      style={{
+                        marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 12,
+                        outline: secIsOver ? "2px solid var(--blue)" : "none", outlineOffset: 2,
+                      }}>
                       <div style={{
                         display: "flex", alignItems: "center", gap: 8, marginBottom: 8,
                         fontSize: 10.5, fontWeight: 800, letterSpacing: 1.2, color: "var(--sub)",
                       }}>
+                        <span className="no-print" draggable title="Drag to reorder this block above or below Looms"
+                          onDragStart={(e) => {
+                            setSummarySecDrag({ wallId: w.id, key: secKey });
+                            try { e.dataTransfer.setData("text/plain", secKey); e.dataTransfer.effectAllowed = "move"; } catch {}
+                          }}
+                          onDragEnd={() => { setSummarySecDrag(null); setSummarySecOver(null); }}
+                          style={{
+                            display: "inline-flex", alignItems: "center", cursor: "grab",
+                            color: "var(--faint)", marginRight: -2,
+                          }}>
+                          <GripVertical size={13} />
+                        </span>
                         REFERENCE
                         <span style={{ color: "var(--faint)", fontWeight: 700 }}>{"\u00b7"} {photos.length} photo{photos.length !== 1 ? "s" : ""}</span>
                       </div>
@@ -4619,7 +4941,14 @@ export default function LoomBuilder() {
                       </div>
                     </div>
                   );
+                  })();
+                  const __blocks = { looms: __loomsBlock, photos: __photosBlock };
+                  const __order = normalizeSummarySectionOrder(w.summarySectionOrder);
+                  return __order.map((k) => (
+                    <React.Fragment key={k}>{__blocks[k]}</React.Fragment>
+                  ));
                 })()}
+                </>}
               </div>
             );
           })}
@@ -5739,6 +6068,53 @@ export default function LoomBuilder() {
               </Btn>
               <input ref={importInputRef} type="file" accept=".json,application/json"
                 onChange={handleImportFile} style={{ display: "none" }} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pngPreview && (
+        <div onClick={() => setPngPreview(null)} style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1400,
+          display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+        }}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background: "var(--card)", border: "1px solid var(--border)", padding: 18,
+            width: "min(760px, 92vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", gap: 12,
+          }}>
+            {pngPreview.error ? (
+              <div style={{ fontWeight: 800, fontSize: 15, color: "var(--danger)" }}>
+                Couldn't render the image: {pngPreview.error}
+              </div>
+            ) : (
+              <>
+                <div style={{ fontWeight: 800, fontSize: 15 }}>
+                  {pngPreview.pages > 1
+                    ? `Saved ${pngPreview.pages} A4-landscape pages to your Downloads.`
+                    : "Saved to your Downloads as an A4-landscape PNG."}
+                </div>
+                <div style={{ fontSize: 12, color: "var(--sub)" }}>
+                  Each page is sized for A4 landscape print. Preview of page 1 below \u2014 if the download didn't start, use the button.
+                </div>
+                <div style={{ overflow: "auto", border: "1px solid var(--border)", background: "var(--thead)" }}>
+                  <img src={pngPreview.url} alt="Show summary" draggable={false}
+                    style={{ display: "block", width: "100%" }} />
+                </div>
+              </>
+            )}
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              {!pngPreview.error && (
+                <a href={pngPreview.url} download={`${(show.name || "show").replace(/[^\w-]+/g, "_")}_summary.png`}
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer",
+                    borderRadius: 0, fontSize: 12.5, fontWeight: 700, padding: "8px 14px",
+                    border: "2px solid var(--border)", background: "var(--card)", color: "var(--text)",
+                    fontFamily: "inherit", textDecoration: "none",
+                  }}>
+                  <Download size={14} /> Try direct download
+                </a>
+              )}
+              <Btn variant="primary" onClick={() => setPngPreview(null)}>Done</Btn>
             </div>
           </div>
         </div>
