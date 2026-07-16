@@ -3731,9 +3731,20 @@ export default function LoomBuilder() {
     return next;
   });
 
+  // Hardware / Utility item lists: no per-item grouping, so "min/exp" collapses
+  // or expands the whole list at once, per wall+section
+  const [itemSecMin, setItemSecMin] = useState({});
+  const itemSecKey = (secKey) => `${wall?.id}:${secKey}`;
+  const setItemSecCollapsed = (secKey, min) => setItemSecMin((m) => ({ ...m, [itemSecKey(secKey)]: min }));
+
   // individual cables tally into one row per type+length; groups expand on demand
   const [indOpen, setIndOpen] = useState({});
   const toggleIndGroup = (k) => setIndOpen((o) => ({ ...o, [k]: !o[k] }));
+  const setAllIndOpen = (open) => setIndOpen((o) => {
+    const next = { ...o };
+    (wall?.individual || []).forEach((c) => { next[`${wall.id}:${c.type}|${c.length}`] = open; });
+    return next;
+  });
 
   const handleCableDrop = (target, targetIdx) => {
     const d = cableDrag;
@@ -3975,6 +3986,12 @@ export default function LoomBuilder() {
 
   const togglePhotoMin = (id) => updateWall((w) => {
     w.photos = getWallPhotos(w).map((p) => (p.id === id ? { ...p, min: !p.min } : p));
+    delete w.photo;
+    return w;
+  });
+
+  const setAllPhotosMin = (min) => updateWall((w) => {
+    w.photos = getWallPhotos(w).map((p) => ({ ...p, min }));
     delete w.photo;
     return w;
   });
@@ -4425,13 +4442,14 @@ export default function LoomBuilder() {
       </div>
 
       {/* ---- wall tabs ---- */}
-      <div style={{
-        background: "var(--card)", borderBottom: "1px solid var(--border)", padding: "10px 24px 14px",
+      <div className="no-print" style={{
+        background: "var(--card)", borderBottom: "1px solid var(--border)", padding: "8px 24px",
+        position: "sticky", top: 0, zIndex: 50, boxShadow: "0 1px 0 var(--border)",
       }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <div style={{
-          fontWeight: 800, fontSize: 12, letterSpacing: 1.5, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6, background: "var(--text)", color: "var(--card)", padding: "5px 12px", marginBottom: 12,
+          fontWeight: 800, fontSize: 10, letterSpacing: 1, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 5, background: "var(--text)", color: "var(--card)", padding: "4px 9px", flexShrink: 0,
         }}>LED WALLS</div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         {show.walls.filter((x) => !x.system).map((w) => (
           <div key={w.id} onClick={() => setActiveWallId(w.id)}
             draggable
@@ -4456,12 +4474,12 @@ export default function LoomBuilder() {
             }}
             title="Drag to reorder walls"
             style={{
-            display: "flex", alignItems: "center", gap: 8, padding: "12px 26px",
-            borderRadius: 0, fontSize: 13.5, fontWeight: 700, cursor: "pointer",
-            textTransform: "uppercase", letterSpacing: 0.4,
+            display: "flex", alignItems: "center", gap: 6, padding: "6px 16px",
+            borderRadius: 0, fontSize: 12.5, fontWeight: 700, cursor: "pointer",
+            textTransform: "uppercase", letterSpacing: 0.3,
             background: w.id === activeWallId ? "var(--text)" : "var(--card)",
             color: w.id === activeWallId ? "var(--card)" : "var(--tab-text)",
-            border: `2px solid ${w.id === activeWallId ? "var(--text)" : "var(--border)"}`,
+            border: `1.5px solid ${w.id === activeWallId ? "var(--text)" : "var(--border)"}`,
             opacity: wallDrag === w.id ? 0.4 : 1,
             boxShadow: wallOver === w.id && wallDrag && wallDrag !== w.id
               ? "inset 3px 0 0 0 #3b82f6" : "none",
@@ -4469,38 +4487,28 @@ export default function LoomBuilder() {
             {w.name}
           </div>
         ))}
-        <div onClick={addWall} style={{
-          display: "flex", alignItems: "center", gap: 8, padding: "12px 22px",
-          borderRadius: 0, fontSize: 13.5, fontWeight: 600, cursor: "pointer",
+        <div onClick={addWall} title="Add wall" style={{
+          display: "flex", alignItems: "center", gap: 5, padding: "6px 12px",
+          borderRadius: 0, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
           background: "transparent", color: "var(--text)",
           border: "1.5px dashed var(--border)",
         }}>
-          <Plus size={15} /> Add Wall
+          <Plus size={13} /> Add Wall
         </div>
         {!summaryView && !systemView && wall && !wall.system && (
           <div style={{
-            marginLeft: "auto", display: "flex", alignItems: "center", gap: 12,
-            border: "1.5px solid var(--purple)", borderRadius: 0, padding: "8px 12px",
+            marginLeft: "auto", display: "flex", alignItems: "center", gap: 6,
+            border: "1.5px solid var(--purple)", borderRadius: 0, padding: "4px 6px 4px 10px",
           }}>
-            <div style={{ display: "grid", gap: 0 }}>
-              <span style={{
-                fontWeight: 800, fontSize: 13.5, maxWidth: 160,
-                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-              }}>{wall.name}</span>
-              <span style={{ fontSize: 10, fontWeight: 600, color: "var(--faint)" }}>Actions</span>
-            </div>
-            <Btn onClick={() => duplicateWall(wall.id)} style={{ padding: "6px 12px", fontSize: 12 }}>
-              <Copy size={12} /> Duplicate
-            </Btn>
-            <Btn variant="danger"
-              onClick={show.walls.filter((x) => !x.system).length > 1 ? () => deleteWall(wall.id) : undefined}
-              title={show.walls.filter((x) => !x.system).length > 1 ? "Delete this wall" : "The last wall can't be deleted"}
-              style={{
-                padding: "6px 12px", fontSize: 12,
-                opacity: show.walls.filter((x) => !x.system).length > 1 ? 1 : 0.4,
-              }}>
-              <Trash2 size={12} /> Delete
-            </Btn>
+            <span style={{
+              fontWeight: 700, fontSize: 12, maxWidth: 140,
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>{wall.name}</span>
+            <IconBtn title="Duplicate wall" onClick={() => duplicateWall(wall.id)}><Copy size={14} /></IconBtn>
+            <IconBtn title={show.walls.filter((x) => !x.system).length > 1 ? "Delete this wall" : "The last wall can't be deleted"}
+              onClick={show.walls.filter((x) => !x.system).length > 1 ? () => deleteWall(wall.id) : undefined}>
+              <Trash2 size={14} color={show.walls.filter((x) => !x.system).length > 1 ? "var(--danger)" : "var(--faint)"} />
+            </IconBtn>
           </div>
         )}
         </div>
@@ -5353,6 +5361,18 @@ export default function LoomBuilder() {
                 );
               })()}
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {wallPhotos.length > 0 && (
+                  <>
+                    <Btn onClick={() => setAllPhotosMin(true)} title="Minimize every photo"
+                      style={{ padding: "5px 10px", fontSize: 12, color: "var(--sub)" }}>
+                      <Minus size={12} /> Minimize All
+                    </Btn>
+                    <Btn onClick={() => setAllPhotosMin(false)} title="Expand every photo"
+                      style={{ padding: "5px 10px", fontSize: 12, color: "var(--sub)" }}>
+                      <Maximize2 size={12} /> Expand All
+                    </Btn>
+                  </>
+                )}
                 <Btn onClick={pasteFromClipboard} style={{ padding: "5px 10px", fontSize: 12 }}>
                   <ClipboardPaste size={13} /> Paste
                 </Btn>
@@ -5509,7 +5529,6 @@ export default function LoomBuilder() {
                   Hardware section is locked — unlock it to add items.
                 </div>
               )}
-              <div style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--faint)", fontWeight: 600 }}>Click a size to add &times;{qaQty} instantly.</div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 10, opacity: wall.hwLocked ? 0.5 : 1 }}>
               {HW_PRESETS.map((p) => (
@@ -5548,7 +5567,6 @@ export default function LoomBuilder() {
                   Utility section is locked — unlock it to add items.
                 </div>
               )}
-              <div style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--faint)", fontWeight: 600 }}>Click a size to add &times;{qaQty} instantly.</div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, opacity: wall.utilLocked ? 0.5 : 1 }}>
               {UTIL_PRESETS.map((p) => {
@@ -5820,6 +5838,18 @@ export default function LoomBuilder() {
                 CABLES <span style={{ fontWeight: 600, fontSize: 10.5, color: "rgba(255,255,255,0.8)" }}>(WALL PACK {"\u2014"} PULL INTO LOOMS)</span>
               </div>
               <div style={{ display: "flex", gap: 8 }}>
+                {(wall.individual || []).length > 0 && (
+                  <>
+                    <Btn onClick={() => setAllIndOpen(false)} title="Collapse every cable group"
+                      style={{ padding: "4px 10px", fontSize: 11.5, color: "var(--sub)" }}>
+                      <Minus size={11} /> Minimize All
+                    </Btn>
+                    <Btn onClick={() => setAllIndOpen(true)} title="Expand every cable group"
+                      style={{ padding: "4px 10px", fontSize: 11.5, color: "var(--sub)" }}>
+                      <Maximize2 size={11} /> Expand All
+                    </Btn>
+                  </>
+                )}
                 <Btn onClick={toggleIndLock}
                   title={wall.indLocked ? "Unlock individual cables" : "Lock individual cables against changes"}
                   style={{
@@ -5923,6 +5953,7 @@ export default function LoomBuilder() {
           {itemSections.map((sec) => {
             const items = wall[sec.key] || [];
             const isLockedList = !!wall[sec.lockKey];
+            const secCollapsed = !!itemSecMin[itemSecKey(sec.key)];
             return (
               <div key={sec.key} id={`sec-${sec.key}`} {...secDrop(sec.key)} style={{
                 ...card, padding: 18, order: secPos[sec.key] + 2,
@@ -5931,7 +5962,7 @@ export default function LoomBuilder() {
               }}>
                 <div style={{
                   display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8,
-                  margin: "-18px -18px 14px", padding: "13px 18px",
+                  margin: secCollapsed ? "-18px -18px 0" : "-18px -18px 14px", padding: "13px 18px",
                   background: "var(--thead)", borderBottom: "1px solid var(--border)",
                 }}>
                   <div style={{ fontWeight: 800, fontSize: 12, letterSpacing: 1.5, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6, background: sec.color, color: "#fff", padding: "5px 12px" }}>
@@ -5941,6 +5972,18 @@ export default function LoomBuilder() {
                     </span>
                   </div>
                   <div style={{ display: "flex", gap: 8 }}>
+                    {items.length > 0 && (
+                      <>
+                        <Btn onClick={() => setItemSecCollapsed(sec.key, true)} title={`Minimize ${sec.title.toLowerCase()}`}
+                          style={{ padding: "4px 10px", fontSize: 11.5, color: "var(--sub)" }}>
+                          <Minus size={11} /> Minimize All
+                        </Btn>
+                        <Btn onClick={() => setItemSecCollapsed(sec.key, false)} title={`Expand ${sec.title.toLowerCase()}`}
+                          style={{ padding: "4px 10px", fontSize: 11.5, color: "var(--sub)" }}>
+                          <Maximize2 size={11} /> Expand All
+                        </Btn>
+                      </>
+                    )}
                     <Btn onClick={() => toggleListLock(sec.lockKey)}
                       title={isLockedList ? `Unlock ${sec.title.toLowerCase()}` : `Lock ${sec.title.toLowerCase()} against changes`}
                       style={{
@@ -5959,16 +6002,18 @@ export default function LoomBuilder() {
                     )}
                   </div>
                 </div>
-                {items.length === 0 && (
+                {!secCollapsed && items.length === 0 && (
                   <div style={{ color: "var(--faint)", fontSize: 12, marginBottom: 8 }}>{sec.hint}</div>
                 )}
-                <ItemTable items={items} locked={isLockedList}
-                  onEditName={(id, v) => editWallItem(sec.key, id, "name", v)}
-                  onEditQty={(id, v) => editWallItem(sec.key, id, "qty", v)}
-                  onEditNotes={(id, v) => editWallItem(sec.key, id, "notes", v)}
-                  onDuplicate={(id) => duplicateWallItem(sec.key, id)}
-                  onDelete={(id) => removeWallItem(sec.key, id)}
-                  onReorder={(id, tIdx) => reorderWallItem(sec.key, id, tIdx)} />
+                {!secCollapsed && (
+                  <ItemTable items={items} locked={isLockedList}
+                    onEditName={(id, v) => editWallItem(sec.key, id, "name", v)}
+                    onEditQty={(id, v) => editWallItem(sec.key, id, "qty", v)}
+                    onEditNotes={(id, v) => editWallItem(sec.key, id, "notes", v)}
+                    onDuplicate={(id) => duplicateWallItem(sec.key, id)}
+                    onDelete={(id) => removeWallItem(sec.key, id)}
+                    onReorder={(id, tIdx) => reorderWallItem(sec.key, id, tIdx)} />
+                )}
               </div>
             );
           })}
